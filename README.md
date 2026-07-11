@@ -2,8 +2,8 @@
 
 `dbx-rs` is an open-source, Splunk-native database collection engine written in Rust. Its target
 architecture runs as a self-contained Splunk-supervised daemon with standalone connector
-diagnostics, requires no JVM, and requires no separately installed database driver for certified
-native connectors.
+diagnostics and an administrative CLI, requires no JVM, and requires no separately installed
+database driver for certified native connectors.
 
 ## Status
 
@@ -47,6 +47,7 @@ Install Rust through `rustup`. The repository pins its toolchain in `rust-toolch
 
 ```bash
 cargo build --workspace
+cargo run -p dbx-rs-cli -- --version
 cargo run -p dbx-rs-daemon -- --version
 cargo run -p dbx-rs-connector-postgres -- --help
 ```

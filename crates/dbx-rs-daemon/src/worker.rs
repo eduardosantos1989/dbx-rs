@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use dbx_rs_config::InputConfig;
+use dbx_rs_config::{InputConfig, QuerySource};
 use dbx_rs_connector_postgres::{JsonCollectionRequest, PostgresConnector};
 use dbx_rs_connector_sdk::{CollectionResult, ConnectionConfig, ConnectorError, TlsMode};
 use dbx_rs_telemetry::{NdjsonTelemetry, OperationLimits, OperationMetrics};
@@ -93,18 +93,7 @@ async fn run_input_inner(
     batch_max_bytes: u64,
     cancellation: CancellationToken,
 ) -> Result<CollectionResult, WorkerError> {
-    let query = String::from_utf8(read_limited(&input.query_file, QUERY_FILE_MAX_BYTES)?).map_err(
-        |_| {
-            DaemonError::new(
-                "DBX-RS-WORKER-0001",
-                "configuration",
-                "query_input",
-                "query file is not valid UTF-8",
-                false,
-                true,
-            )
-        },
-    )?;
+    let query = resolve_query(&input.query)?;
     let tls_ca_pem = input
         .tls_ca_file
         .as_deref()
@@ -167,6 +156,24 @@ async fn run_input_inner(
     Ok(collection)
 }
 
+fn resolve_query(source: &QuerySource) -> Result<String, WorkerError> {
+    match source {
+        QuerySource::Inline(query) => Ok(query.clone()),
+        QuerySource::File(path) => String::from_utf8(read_limited(path, QUERY_FILE_MAX_BYTES)?)
+            .map_err(|_| {
+                DaemonError::new(
+                    "DBX-RS-WORKER-0001",
+                    "configuration",
+                    "query_input",
+                    "query file is not valid UTF-8",
+                    false,
+                    true,
+                )
+                .into()
+            }),
+    }
+}
+
 async fn deliver_rows(
     mut line_rx: mpsc::Receiver<Vec<u8>>,
     hec: HecClient,
@@ -216,4 +223,19 @@ async fn send_batch(hec: HecClient, body: Vec<u8>) -> Result<(), WorkerError> {
             )
         })?
         .map_err(WorkerError::Daemon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_query_resolves_without_file_access() {
+        let source = QuerySource::Inline("SELECT 1 AS value".into());
+        let query = resolve_query(&source)
+            .ok()
+            .expect("inline query must resolve");
+
+        assert_eq!(query, "SELECT 1 AS value");
+    }
 }

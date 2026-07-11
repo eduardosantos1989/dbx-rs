@@ -1,0 +1,18 @@
+[package]
+name = "dbx-rs-cli"
+description = "Administrative command-line interface for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dbx-rs-config.workspace = true
+
+[[bin]]
+name = "dbx-rs"
+path = "src/main.rs"
+
+[lints]
+workspace = true

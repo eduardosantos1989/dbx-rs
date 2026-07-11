@@ -27,11 +27,15 @@ tls_server_name = <DNS name>
 
 tls_ca_file = <absolute path>
 * Optional PEM CA bundle. Supports an initial $SPLUNK_HOME/ path component.
-* The resolved path must remain inside $SPLUNK_HOME.
+* PostgreSQL certificate files must resolve below the app's certs/psql directory.
 
 query_file = <absolute path>
 * UTF-8 SELECT or WITH query file. SQL is not written to operational logs.
-* The resolved path must remain inside $SPLUNK_HOME.
+* PostgreSQL query files must resolve below the app's queries/psql directory.
+
+query = <SQL text>
+* Inline SELECT or WITH query for short definitions.
+* Configure exactly one of query_file or query. SQL is not written to operational logs.
 
 connect_timeout_secs = <positive integer>
 probe_timeout_secs = <positive integer>

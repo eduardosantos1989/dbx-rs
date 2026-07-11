@@ -12,6 +12,7 @@ const HARD_HEC_EVENT_BYTES: u64 = 10_000_000;
 const HARD_HEC_BATCH_BYTES: u64 = 10_000_000;
 const HARD_INPUT_ROWS: u64 = 100_000;
 const HARD_INPUT_BYTES: u64 = 1024 * 1024 * 1024;
+const HARD_INLINE_QUERY_BYTES: usize = 1024 * 1024;
 
 const GENERIC_FILE: &str = "dbxrs_generic.conf";
 const INPUTS_FILE: &str = "dbxrs_inputs.conf";
@@ -121,6 +122,7 @@ pub enum IndexerAcknowledgment {
 pub struct InputConfig {
     pub name: String,
     pub disabled: bool,
+    pub connector: String,
     pub interval: Duration,
     pub host: String,
     pub port: u16,
@@ -130,7 +132,7 @@ pub struct InputConfig {
     pub tls_mode: String,
     pub tls_server_name: Option<String>,
     pub tls_ca_file: Option<PathBuf>,
-    pub query_file: PathBuf,
+    pub query: QuerySource,
     pub connect_timeout: Duration,
     pub probe_timeout: Duration,
     pub max_rows: u64,
@@ -139,6 +141,21 @@ pub struct InputConfig {
     pub index: String,
     pub sourcetype: String,
     pub source: String,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum QuerySource {
+    File(PathBuf),
+    Inline(String),
+}
+
+impl std::fmt::Debug for QuerySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(_) => formatter.write_str("File([CONFIGURED])"),
+            Self::Inline(_) => formatter.write_str("Inline([REDACTED])"),
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -190,7 +207,7 @@ pub fn load_effective_config(
     let generic = parse_generic(&generic, splunk_home)?;
 
     let inputs = load_layered(app_home, INPUTS_FILE)?;
-    let inputs = parse_inputs(&inputs, splunk_home, &generic)?;
+    let inputs = parse_inputs(&inputs, app_home, splunk_home, &generic)?;
     if generic.hec.state == HecState::Disabled && inputs.iter().any(|input| !input.disabled) {
         return Err(ConfigError::new("DBX-RS-CFG-0039", "hec.enabled"));
     }
@@ -429,6 +446,7 @@ fn parse_hec(ini: &Ini) -> Result<HecConfig, ConfigError> {
 
 fn parse_inputs(
     ini: &Ini,
+    app_home: &Path,
     splunk_home: &Path,
     generic: &GenericConfig,
 ) -> Result<Vec<InputConfig>, ConfigError> {
@@ -444,6 +462,7 @@ fn parse_inputs(
         "tls_mode",
         "tls_server_name",
         "tls_ca_file",
+        "query",
         "query_file",
         "connect_timeout_secs",
         "probe_timeout_secs",
@@ -468,7 +487,7 @@ fn parse_inputs(
         if values.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
             return Err(ConfigError::new("DBX-RS-CFG-0012", "input.setting"));
         }
-        inputs.push(parse_input(ini, name, splunk_home, generic)?);
+        inputs.push(parse_input(ini, name, app_home, splunk_home, generic)?);
     }
     inputs.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(inputs)
@@ -477,6 +496,7 @@ fn parse_inputs(
 fn parse_input(
     ini: &Ini,
     name: &str,
+    app_home: &Path,
     splunk_home: &Path,
     generic: &GenericConfig,
 ) -> Result<InputConfig, ConfigError> {
@@ -519,6 +539,7 @@ fn parse_input(
     Ok(InputConfig {
         name: name.into(),
         disabled: required_bool(ini, name, "disabled")?,
+        connector: connector.clone(),
         interval: Duration::from_secs(interval_secs),
         host: required_nonempty(ini, name, "host")?,
         port,
@@ -527,8 +548,15 @@ fn parse_input(
         secret_ref,
         tls_mode,
         tls_server_name: optional(ini, name, "tls_server_name"),
-        tls_ca_file: optional_path(ini, name, "tls_ca_file", splunk_home)?,
-        query_file: required_path(ini, name, "query_file", splunk_home)?,
+        tls_ca_file: optional_asset_path(
+            ini,
+            name,
+            "tls_ca_file",
+            splunk_home,
+            &app_home.join("certs").join(query_namespace(&connector)),
+            "DBX-RS-CFG-0049",
+        )?,
+        query: parse_query_source(ini, name, app_home, splunk_home, &connector)?,
         connect_timeout,
         probe_timeout,
         max_rows,
@@ -539,6 +567,42 @@ fn parse_input(
             .unwrap_or_else(|| generic.hec.sourcetype.clone()),
         source: optional(ini, name, "source").unwrap_or_else(|| generic.hec.source.clone()),
     })
+}
+
+fn parse_query_source(
+    ini: &Ini,
+    section: &str,
+    app_home: &Path,
+    splunk_home: &Path,
+    connector: &str,
+) -> Result<QuerySource, ConfigError> {
+    let inline = optional(ini, section, "query").filter(|value| !value.is_empty());
+    let file = optional_asset_path(
+        ini,
+        section,
+        "query_file",
+        splunk_home,
+        &app_home.join("queries").join(query_namespace(connector)),
+        "DBX-RS-CFG-0048",
+    )?;
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(ConfigError::new("DBX-RS-CFG-0046", "input.query")),
+        (None, None) => Err(ConfigError::new("DBX-RS-CFG-0045", "input.query")),
+        (Some(query), None) => {
+            if query.len() > HARD_INLINE_QUERY_BYTES || query.contains('\0') {
+                return Err(ConfigError::new("DBX-RS-CFG-0047", "input.query"));
+            }
+            Ok(QuerySource::Inline(query))
+        }
+        (None, Some(path)) => Ok(QuerySource::File(path)),
+    }
+}
+
+fn query_namespace(connector: &str) -> &'static str {
+    match connector {
+        "postgres" => "psql",
+        _ => "unsupported",
+    }
 }
 
 fn parse_worker_limit(value: &str) -> Result<WorkerLimit, ConfigError> {
@@ -684,6 +748,24 @@ fn optional_path(
         .transpose()
 }
 
+fn optional_asset_path(
+    ini: &Ini,
+    section: &str,
+    key: &'static str,
+    splunk_home: &Path,
+    asset_root: &Path,
+    error_code: &'static str,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let path = optional_path(ini, section, key, splunk_home)?;
+    if path
+        .as_ref()
+        .is_some_and(|path| path == asset_root || !path.starts_with(asset_root))
+    {
+        return Err(ConfigError::new(error_code, key));
+    }
+    Ok(path)
+}
+
 fn expand_path(
     value: &str,
     splunk_home: &Path,
@@ -726,7 +808,7 @@ mod tests {
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
-        let app = root.join("app");
+        let app = root.join("etc/apps/TA-dbx-rs");
         fs::create_dir_all(app.join("default")).expect("default directory must be created");
         fs::create_dir_all(app.join("local")).expect("local directory must be created");
         fs::write(app.join("default").join(GENERIC_FILE), generic_config())
@@ -789,8 +871,8 @@ username = reader
 secret_ref = local:heartbeat
 tls_mode = verify-full
 tls_server_name = database.example
-tls_ca_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/database-ca.pem
-query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/heartbeat.sql
+tls_ca_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/certs/psql/database-ca.pem
+query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/heartbeat.sql
 connect_timeout_secs = 10
 probe_timeout_secs = 10
 max_rows = 1000
@@ -813,6 +895,8 @@ source = dbx_rs:heartbeat
 
         let effective = load_effective_config(&app, &root).expect("config must load");
         assert_eq!(effective.inputs.len(), 1);
+        assert_eq!(effective.inputs[0].connector, "postgres");
+        assert!(matches!(&effective.inputs[0].query, QuerySource::File(_)));
         assert_eq!(
             effective.generic.logging.max_file_bytes,
             HARD_LOG_FILE_BYTES
@@ -908,7 +992,7 @@ source = dbx_rs:heartbeat
     fn rejects_input_files_outside_splunk_home() {
         let (root, app) = fixture();
         let external_query = input_config().replace(
-            "query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/heartbeat.sql",
+            "query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/heartbeat.sql",
             "query_file = /tmp/heartbeat.sql",
         );
         fs::write(app.join("default").join(INPUTS_FILE), external_query)
@@ -917,6 +1001,85 @@ source = dbx_rs:heartbeat
         let error = load_effective_config(&app, &root).expect_err("external query must fail");
         assert_eq!(error.code(), "DBX-RS-CFG-0042");
         assert_eq!(error.field(), "query_file");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn accepts_inline_query_and_redacts_its_debug_output() {
+        let (root, app) = fixture();
+        let inline = input_config().replace(
+            "query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/heartbeat.sql",
+            "query = SELECT 42 AS private_value",
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), inline)
+            .expect("inline fixture must be written");
+
+        let effective = load_effective_config(&app, &root).expect("inline query must load");
+        assert_eq!(
+            effective.inputs[0].query,
+            QuerySource::Inline("SELECT 42 AS private_value".into())
+        );
+        let debug = format!("{:?}", effective.inputs[0].query);
+        assert_eq!(debug, "Inline([REDACTED])");
+        assert!(!debug.contains("private_value"));
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_ambiguous_query_sources() {
+        let (root, app) = fixture();
+        let ambiguous = input_config().replace(
+            "query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/heartbeat.sql",
+            "query = SELECT 1\nquery_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/heartbeat.sql",
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), ambiguous)
+            .expect("ambiguous fixture must be written");
+
+        let error = load_effective_config(&app, &root).expect_err("ambiguous query must fail");
+        assert_eq!(error.code(), "DBX-RS-CFG-0046");
+        assert_eq!(error.field(), "input.query");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_missing_query_source() {
+        let (root, app) = fixture();
+        let missing = input_config().replace(
+            "query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/heartbeat.sql\n",
+            "",
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), missing)
+            .expect("missing-query fixture must be written");
+
+        let error = load_effective_config(&app, &root).expect_err("missing query must fail");
+        assert_eq!(error.code(), "DBX-RS-CFG-0045");
+        assert_eq!(error.field(), "input.query");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_query_and_ca_files_in_local() {
+        let (root, app) = fixture();
+        let local_query = input_config().replace(
+            "query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/heartbeat.sql",
+            "query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/heartbeat.sql",
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), local_query)
+            .expect("local query fixture must be written");
+        let query_error =
+            load_effective_config(&app, &root).expect_err("local query path must fail");
+        assert_eq!(query_error.code(), "DBX-RS-CFG-0048");
+        assert_eq!(query_error.field(), "query_file");
+
+        let local_ca = input_config().replace(
+            "tls_ca_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/certs/psql/database-ca.pem",
+            "tls_ca_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/database-ca.pem",
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), local_ca)
+            .expect("local CA fixture must be written");
+        let ca_error = load_effective_config(&app, &root).expect_err("local CA path must fail");
+        assert_eq!(ca_error.code(), "DBX-RS-CFG-0049");
+        assert_eq!(ca_error.field(), "tls_ca_file");
         fs::remove_dir_all(root).expect("fixture must be removed");
     }
 }

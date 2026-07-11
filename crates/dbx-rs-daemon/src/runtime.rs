@@ -457,6 +457,7 @@ mod tests {
         InputConfig {
             name: name.into(),
             disabled: false,
+            connector: "postgres".into(),
             interval: Duration::from_mins(1),
             host: "database.example".into(),
             port: 5432,
@@ -466,7 +467,7 @@ mod tests {
             tls_mode: "verify-full".into(),
             tls_server_name: Some("database.example".into()),
             tls_ca_file: Some(PathBuf::from("/ca.pem")),
-            query_file: PathBuf::from("/query.sql"),
+            query: dbx_rs_config::QuerySource::File(PathBuf::from("/query.sql")),
             connect_timeout: Duration::from_secs(10),
             probe_timeout: Duration::from_secs(10),
             max_rows: 100,

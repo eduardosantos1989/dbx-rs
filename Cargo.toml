@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "connectors/postgres",
+    "crates/dbx-rs-cli",
     "crates/dbx-rs-config",
     "crates/dbx-rs-connector-sdk",
     "crates/dbx-rs-daemon",

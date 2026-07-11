@@ -16,6 +16,18 @@ and HEC transport settings. Put overrides in `local/dbxrs_generic.conf`.
 stanza references a credential by `local:<name>`. Plaintext password, secret, token, and connection
 string settings are rejected.
 
+Put PostgreSQL query files in `queries/psql/` and PostgreSQL CA bundles in `certs/psql/`. Input
+stanzas may instead use `query = ...` for short inline SQL, but `query` and `query_file` are mutually
+exclusive. The daemon reads these assets but does not create or rewrite them. Installation-specific
+query and certificate files are ignored by the public source tree and must be supplied by an
+approved package, deployment server, deployer, or future UI workflow.
+
+Validate the effective layered configuration without starting the daemon:
+
+```bash
+$SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs config validate
+```
+
 Store a credential without placing it in process arguments, environment variables, or config:
 
 ```bash
@@ -31,7 +43,8 @@ encrypted secret directory together; losing the key makes the secrets unrecovera
 Transient daemon files live under `$SPLUNK_HOME/var/run/splunk/dbx-rs`; persistent generated state
 and identity live under `$SPLUNK_HOME/var/lib/splunk/dbx-rs`. A future durable delivery spool must
 also live under Splunk's `var` tree when implemented. Generated path settings are rejected unless
-they resolve under `$SPLUNK_HOME/var`, and input file references must remain inside `$SPLUNK_HOME`.
+they resolve under `$SPLUNK_HOME/var`. The daemon does not generate files under `local/` except the
+managed HEC `inputs.conf` that Splunk itself requires in the configuration layer.
 
 ## HEC bootstrap
 
@@ -40,6 +53,9 @@ localhost server certificate. It reconciles only `[http]` and the configured `[h
 in `local/inputs.conf`; unrelated stanzas remain present. Splunk requires that managed configuration
 file in the app configuration tree. The token and certificate material instead remain under
 `$SPLUNK_HOME/var/lib/splunk/dbx-rs/hec` and must never be published.
+
+Database trust certificates under `certs/` are deployable input assets and are separate from this
+generated HEC server identity.
 
 Run bootstrap after installing the app and before the first Splunk restart:
 
@@ -81,3 +97,11 @@ The durable disk spool and database checkpoints are not implemented yet. A failu
 batch was accepted can replay those rows on the next query, and a changing source query can still
 have gaps without a cursor protocol. Do not treat this slice as production end-to-end at-least-once
 collection until spool and checkpoint state machines are added.
+
+## Query-path upgrade and rollback
+
+Before upgrading an existing input, move its PostgreSQL query file from `local/` to `queries/psql/`
+and its database CA bundle from `local/` to `certs/psql/`, preserving ownership and permissions, then
+update both paths in `local/dbxrs_inputs.conf`. To roll back to a binary that permits the older
+layout, move the files back and restore the prior paths. A configuration that uses inline `query`
+must first be converted to a query file because older binaries do not recognize that setting.

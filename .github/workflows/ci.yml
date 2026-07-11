@@ -67,6 +67,7 @@ jobs:
         shell: bash
         run: |
           binaries=(
+            target/x86_64-unknown-linux-musl/release/dbx-rs
             target/x86_64-unknown-linux-musl/release/dbx-rs-daemon
             target/x86_64-unknown-linux-musl/release/dbx-rs-connector-postgres
           )
@@ -81,5 +82,6 @@ jobs:
               exit 1
             fi
           done
+          target/x86_64-unknown-linux-musl/release/dbx-rs --version
           target/x86_64-unknown-linux-musl/release/dbx-rs-daemon --version
           target/x86_64-unknown-linux-musl/release/dbx-rs-connector-postgres --help >/dev/null
