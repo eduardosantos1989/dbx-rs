@@ -1,16 +1,15 @@
 [package]
-name = "dbx-rs-cli"
-description = "Command-line entry point for dbx-rs"
+name = "dbx-rs-telemetry"
+description = "Safe operational NDJSON telemetry for dbx-rs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
-[[bin]]
-name = "dbx-rs"
-path = "src/main.rs"
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
-

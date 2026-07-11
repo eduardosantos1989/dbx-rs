@@ -1,0 +1,32 @@
+[package]
+name = "dbx-rs-connector-postgres"
+description = "Native PostgreSQL connector for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dbx-rs-connector-sdk.workspace = true
+dbx-rs-telemetry.workspace = true
+futures-util.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+tokio-util.workspace = true
+webpki-roots.workspace = true
+
+[[bin]]
+name = "dbx-rs-connector-postgres"
+path = "src/main.rs"
+
+[lints]
+workspace = true

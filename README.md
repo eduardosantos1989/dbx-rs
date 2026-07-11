@@ -1,18 +1,36 @@
 # dbx-rs
 
 `dbx-rs` is an open-source, Splunk-native database collection engine written in Rust. Its target
-architecture runs as a self-contained Splunk modular input or standalone collector, requires no
-JVM, and requires no separately installed database driver for certified native connectors.
+architecture runs as a self-contained Splunk-supervised daemon with standalone connector
+diagnostics, requires no JVM, and requires no separately installed database driver for certified
+native connectors.
 
 ## Status
 
-The project is at repository bootstrap. The current executable only exposes version and help
-output; it does not yet connect to databases or Splunk. The design baseline is documented in
-[`docs/dbx-rs-ideation-and-engineering-plan.md`](docs/dbx-rs-ideation-and-engineering-plan.md).
+The project is at an early vertical-slice stage. The PostgreSQL connector validates configuration,
+probes with verified Rustls TLS, and streams bounded JSON rows. A singleton daemon is supervised as a
+continuous Splunk scripted input, loads typed layered configuration, keeps database credentials in
+an installation-specific authenticated encrypted store, and sends CPU-bounded non-overlapping input
+runs to verified local HEC. It can generate and reconcile a stable local HEC token and certificate
+without Splunk management credentials. Daemon and connector operations emit versioned, redacted
+NDJSON lifecycle metrics with epoch timestamps to Splunk's `dbx-trace.log`.
 
-The first product objective is a PostgreSQL modular input with durable, at-least-once collection
-and a composite rising cursor. Reliability and explicit delivery semantics take priority over
-connector count.
+Durable spool recovery and database checkpoint protocols are not implemented yet. HEC ACK confirms
+individual accepted batches, but the current end-to-end path must not be described as production
+at-least-once collection until those state machines exist. Detailed planning and operational
+material is maintained privately until it has been reviewed for public release.
+
+The first product objective is a PostgreSQL input under the Splunk-supervised daemon with durable,
+at-least-once collection and a composite rising cursor. Reliability and explicit delivery semantics
+take priority over connector count.
+
+## Linux compatibility
+
+The required deployment target includes legacy Linux x86-64 hosts that use glibc 2.10 or newer.
+The product will ship a static-musl Linux binary so its own runtime does not require a newer glibc;
+the normal Rust GNU target requires glibc 2.17 or newer. Kernel, CPU, Splunk, and database support
+remain separate compatibility dimensions and will be certified with recorded tests rather than
+assumed from the glibc version.
 
 ## Principles
 
@@ -29,8 +47,8 @@ Install Rust through `rustup`. The repository pins its toolchain in `rust-toolch
 
 ```bash
 cargo build --workspace
-cargo run -p dbx-rs-cli -- --version
-cargo run -p dbx-rs-cli -- help
+cargo run -p dbx-rs-daemon -- --version
+cargo run -p dbx-rs-connector-postgres -- --help
 ```
 
 Run the complete bootstrap checks with:
@@ -51,8 +69,8 @@ cargo install cargo-deny --version 0.20.2 --locked
 ## Contributing
 
 Read `AGENTS.md` and `CONTRIBUTING.md` before making changes. Foundational architecture changes
-must be recorded as ADRs, and meaningful work must update the repository memory under
-`docs/memory/`.
+require maintainer review; private ADRs and repository memory are not public contribution
+artifacts.
 
 ## Security
 

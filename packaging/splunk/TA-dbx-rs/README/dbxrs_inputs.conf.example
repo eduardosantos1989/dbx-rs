@@ -1,0 +1,21 @@
+[example_postgres]
+disabled = true
+connector = postgres
+interval_secs = 60
+host = database.example
+port = 5432
+database = events
+username = dbx_reader
+secret_ref = local:example_postgres
+tls_mode = verify-full
+tls_server_name = database.example
+tls_ca_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/database-ca.pem
+query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/example_postgres.sql
+connect_timeout_secs = 10
+probe_timeout_secs = 10
+query_timeout_secs = 30
+max_rows = 1000
+max_bytes = 1048576
+index = dbx_rs_test
+sourcetype = dbx_rs:postgres:row
+source = dbx_rs:example_postgres

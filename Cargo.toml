@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/dbx-rs-cli"]
+members = [
+    "connectors/postgres",
+    "crates/dbx-rs-config",
+    "crates/dbx-rs-connector-sdk",
+    "crates/dbx-rs-daemon",
+    "crates/dbx-rs-telemetry",
+]
 resolver = "3"
 
 [workspace.package]
@@ -7,6 +13,25 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
+
+[workspace.dependencies]
+configparser = { version = "3.2.0", default-features = false }
+dbx-rs-config = { version = "0.1.0", path = "crates/dbx-rs-config" }
+dbx-rs-connector-sdk = { version = "0.1.0", path = "crates/dbx-rs-connector-sdk" }
+dbx-rs-telemetry = { version = "0.1.0", path = "crates/dbx-rs-telemetry" }
+futures-util = { version = "0.3.32", default-features = false }
+http = { version = "1.4.2", default-features = false }
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
+ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", default-features = false, features = ["raw_value", "std"] }
+tokio = { version = "1.52.3", default-features = false }
+tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+webpki-roots = { version = "1.0.8", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

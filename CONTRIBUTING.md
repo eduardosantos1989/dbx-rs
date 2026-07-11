@@ -2,13 +2,13 @@
 
 ## Before starting
 
-1. Read `AGENTS.md` and the relevant design sections or ADRs.
-2. Read the repository memory under `docs/memory/`.
-3. Select one small issue or acceptance criterion.
-4. Create or update a session log under `docs/memory/sessions/`.
+1. Read `AGENTS.md` and the public documentation relevant to the change.
+2. Select one small issue or acceptance criterion.
+3. Keep implementation notes, credentials, topology, and operational details out of the public
+   repository.
 
-Do not combine a foundational architecture change with unrelated feature work. Record an ADR
-before changing an accepted architecture decision.
+Do not combine a foundational architecture change with unrelated feature work. Foundational
+architecture decisions are maintained privately by maintainers before any public change is made.
 
 ## Development setup
 
@@ -46,4 +46,3 @@ Document:
 
 Use precise support-tier and delivery language. A connector is not Native Certified without its
 required compatibility evidence, and collection is not universally exactly-once.
-

@@ -6,10 +6,17 @@ its directory, but it must not weaken these requirements.
 ## Required workflow
 
 - Read the nearest `AGENTS.md` before changing files.
-- Read `docs/memory/current-state.md`, `docs/memory/known-failures.md`, and
-  `docs/memory/open-questions.md` before implementation.
-- Read the relevant plan under `docs/memory/plans/active/` when one exists.
-- Create or update a session file under `docs/memory/sessions/` for every meaningful task.
+- In the private maintainer workspace, read `docs/memory/current-state.md`,
+  `docs/memory/known-failures.md`, and `docs/memory/open-questions.md` before implementation.
+- In the private maintainer workspace, read the relevant plan under `docs/memory/plans/active/`
+  when one exists.
+- Create or update a private session file under `docs/memory/sessions/` for every meaningful
+  maintainer task.
+- Treat `docs/memory/`, architecture plans, ADRs, and operations notes as private local material by
+  default. Do not add them to this public repository; use an approved private repository or store
+  when shared, versioned memory is required.
+- Publish documentation under `docs/public/` only after it has been explicitly reviewed for public
+  release.
 - Keep facts, evidence, and hypotheses distinct.
 - Never state a root cause without evidence.
 - Record what worked, what failed, commands executed, and the next recommended step.
@@ -40,6 +47,8 @@ Every session file must include:
 - Do not log credentials, tokens, bound values, row payloads, or unredacted SQL by default.
 - Do not silently weaken TLS or perform lossy type conversion.
 - Do not add unsafe Rust outside an isolated crate approved by an ADR.
+- Ship Native Certified Linux x86-64 artifacts as static-musl binaries with no ELF program
+  interpreter or dynamic-library dependencies unless a later ADR explicitly narrows that rule.
 - Document operational impact and rollback for every persistent-format change.
 
 ## Engineering expectations
@@ -56,4 +65,3 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo deny check
 ```
-

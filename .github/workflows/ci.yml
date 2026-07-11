@@ -45,3 +45,41 @@ jobs:
       - name: Check dependencies
         if: runner.os == 'Linux'
         run: cargo deny check
+
+  linux-musl:
+    name: Linux static-musl artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain and target
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup target add x86_64-unknown-linux-musl --toolchain 1.97.0
+
+      - name: Build release artifacts
+        run: cargo build --release --target x86_64-unknown-linux-musl --workspace
+
+      - name: Verify static Linux linkage
+        shell: bash
+        run: |
+          binaries=(
+            target/x86_64-unknown-linux-musl/release/dbx-rs-daemon
+            target/x86_64-unknown-linux-musl/release/dbx-rs-connector-postgres
+          )
+          for binary in "${binaries[@]}"; do
+            file "$binary"
+            if readelf -l "$binary" | grep -q 'INTERP'; then
+              echo "$binary has a dynamic program interpreter"
+              exit 1
+            fi
+            if readelf -d "$binary" | grep -q 'NEEDED'; then
+              echo "$binary has dynamic library dependencies"
+              exit 1
+            fi
+          done
+          target/x86_64-unknown-linux-musl/release/dbx-rs-daemon --version
+          target/x86_64-unknown-linux-musl/release/dbx-rs-connector-postgres --help >/dev/null
