@@ -1,0 +1,8 @@
+/target/
+/.idea/
+/.vscode/
+/docs/*
+*.swp
+*.swo
+.env
+.env.*
