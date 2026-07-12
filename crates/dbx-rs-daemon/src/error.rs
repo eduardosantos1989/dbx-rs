@@ -1,6 +1,8 @@
 use std::io;
 
 use dbx_rs_config::ConfigError;
+use dbx_rs_secure_store::SecureStoreError;
+use dbx_rs_spool::SpoolError;
 
 #[derive(Debug)]
 pub struct DaemonError {
@@ -98,3 +100,31 @@ impl std::fmt::Display for DaemonError {
 }
 
 impl std::error::Error for DaemonError {}
+
+impl From<SecureStoreError> for DaemonError {
+    fn from(error: SecureStoreError) -> Self {
+        Self {
+            code: error.code(),
+            class: error.class(),
+            stage: error.stage(),
+            message: error.message(),
+            retryable: error.retryable(),
+            configuration_error: error.configuration_error(),
+            io_kind: error.io_kind(),
+        }
+    }
+}
+
+impl From<SpoolError> for DaemonError {
+    fn from(error: SpoolError) -> Self {
+        Self {
+            code: error.code(),
+            class: "storage",
+            stage: error.stage(),
+            message: "durable spool operation failed",
+            retryable: false,
+            configuration_error: false,
+            io_kind: error.io_kind(),
+        }
+    }
+}

@@ -8,6 +8,7 @@ connector = postgres
 interval_secs = <positive integer>
 * Delay from one completed collection to the next run.
 * A stanza never overlaps with its own previous run.
+* Valid range: 1 through 31536000 seconds.
 
 host = <hostname or address>
 port = <positive integer>
@@ -46,9 +47,13 @@ max_rows = <positive integer>
 * Hard maximum: 100000 rows per run.
 
 max_bytes = <positive integer>
+* Together with max_rows, must fit the configured atomic spool segment including bounded envelope
+  and encryption overhead. Raise spool.segment_max_bytes or lower these input limits if validation
+  reports input.spool_bound.
 * Hard maximum: 1073741824 unencoded row bytes per run.
 
 index = <label>
 sourcetype = <label>
 source = <label>
 * Optional HEC metadata. Omitted values inherit the generic HEC defaults.
+* Labels are limited to 128 ASCII letters, digits, and - _ . : / + characters.

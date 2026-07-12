@@ -2,6 +2,7 @@
 all-features = true
 targets = [
     "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
 ]
 
@@ -25,6 +26,7 @@ wildcards = "deny"
 skip = [
     { crate = "const-oid@0.9.6", reason = "tokio-postgres-rustls uses x509-cert on const-oid 0.9 while postgres-protocol uses digest on const-oid 0.10" },
     { crate = "getrandom@0.2.17", reason = "Rustls ring uses getrandom 0.2 while tokio-postgres uses rand on getrandom 0.4" },
+    { crate = "getrandom@0.3.4", reason = "Arrow ahash uses getrandom 0.3 while Rustls ring and tokio-postgres use getrandom 0.2 and 0.4" },
 ]
 
 [sources]

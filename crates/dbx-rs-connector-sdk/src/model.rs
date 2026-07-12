@@ -118,6 +118,12 @@ pub struct CollectionResult {
     pub request_id: String,
     pub rows_read: u64,
     pub bytes_read: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub checkpoint_candidate: Option<crate::TimestampIdCursor>,
+    #[serde(default)]
+    pub scan_resume: Option<crate::TimestampIdCursor>,
 }
 
 #[cfg(test)]
@@ -161,5 +167,16 @@ mod tests {
 
         assert!(debug.contains("[CONFIGURED]"));
         assert!(!debug.contains("private certificate material"));
+    }
+
+    #[test]
+    fn legacy_collection_result_defaults_cursor_fields() {
+        let result: CollectionResult =
+            serde_json::from_str(r#"{"request_id":"request-1","rows_read":2,"bytes_read":42}"#)
+                .expect("contract 1.0 result should deserialize");
+
+        assert!(!result.truncated);
+        assert_eq!(result.checkpoint_candidate, None);
+        assert_eq!(result.scan_resume, None);
     }
 }

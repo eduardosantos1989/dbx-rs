@@ -26,6 +26,15 @@ hec_server_pem_file = <absolute path>
 hec_ca_file = <absolute path>
 * CA certificate used by the daemon to verify managed localhost HEC.
 
+spool_key_file = <absolute path>
+* Installation-specific spool-encryption key, distinct from the credential key.
+
+state_dir = <absolute path>
+* Durable checkpoint state below $SPLUNK_HOME/var.
+
+spool_dir = <absolute path>
+* Encrypted durable event spool below $SPLUNK_HOME/var.
+
 managed_inputs_file = <absolute path>
 * Splunk inputs.conf file updated when manage_input is true.
 * This Splunk-discovered configuration file is the only generated default outside var.
@@ -57,6 +66,17 @@ max_workers = auto | <positive integer>
 * Maximum concurrent database workers.
 * The daemon always caps this value at available CPU parallelism.
 
+[spool]
+segment_max_bytes = <positive integer>
+* Maximum encrypted bytes reserved for one segment. Valid range: 4096 through 1073741824.
+
+input_max_bytes = <positive integer>
+* Per-input spool quota. Must be at least segment_max_bytes and no more than 107374182400.
+
+total_max_bytes = <positive integer>
+* Global spool quota. Must be at least input_max_bytes and no more than 1099511627776.
+* Quota exhaustion stops new database queries; ready data is never deleted automatically.
+
 [hec]
 enabled = <boolean>
 * Enables HEC as the daemon output.
@@ -84,6 +104,7 @@ verify_tls = <boolean>
 
 timeout_secs = <positive integer>
 * Global HEC request and indexer-acknowledgment timeout.
+* Valid range: 1 through 86400 seconds.
 
 batch_max_events = <positive integer>
 * Maximum events in one HEC request. Valid maximum: 10000.

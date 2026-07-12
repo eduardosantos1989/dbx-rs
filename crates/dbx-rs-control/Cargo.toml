@@ -1,0 +1,23 @@
+[package]
+name = "dbx-rs-control"
+description = "Typed administrative control operations for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dbx-rs-config.workspace = true
+dbx-rs-connector-sdk.workspace = true
+dbx-rs-native-connectors.workspace = true
+dbx-rs-secure-store.workspace = true
+dbx-rs-telemetry.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

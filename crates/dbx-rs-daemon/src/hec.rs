@@ -4,6 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dbx_rs_config::{HecConfig, IndexerAcknowledgment, TlsVerification};
+use dbx_rs_secure_store::read_limited;
 use http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -11,10 +12,8 @@ use ureq::tls::{Certificate, RootCerts, TlsConfig};
 
 use crate::error::DaemonError;
 use crate::identity::{HecToken, generate_uuid};
-use crate::secure_fs::read_limited;
 
 const MAX_HEC_RESPONSE_BYTES: u64 = 4 * 1024;
-const SEND_ATTEMPTS: u32 = 3;
 const ACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
@@ -129,6 +128,7 @@ impl HecClient {
         &self,
         line: Vec<u8>,
         metadata: &EventMetadata,
+        event_id: &str,
     ) -> Result<Vec<u8>, DaemonError> {
         let event = String::from_utf8(line).map_err(|_| {
             DaemonError::new(
@@ -155,6 +155,9 @@ impl HecClient {
             index: &metadata.index,
             sourcetype: &metadata.sourcetype,
             source: &metadata.source,
+            fields: EventFields {
+                dbxrs_event_id: event_id,
+            },
             event: &event,
         };
         let encoded = serde_json::to_vec(&envelope).map_err(|_| {
@@ -192,17 +195,7 @@ impl HecClient {
             ));
         }
 
-        let mut last_error = None;
-        for attempt in 0..SEND_ATTEMPTS {
-            match self.send_once(body) {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = Some(error),
-            }
-            if attempt + 1 < SEND_ATTEMPTS {
-                thread::sleep(Duration::from_millis(250 * u64::from(attempt + 1)));
-            }
-        }
-        Err(last_error.expect("at least one HEC send attempt must execute"))
+        self.send_once(body)
     }
 
     fn send_once(&self, body: &[u8]) -> Result<(), DaemonError> {
@@ -324,7 +317,13 @@ struct EventEnvelope<'a> {
     index: &'a str,
     sourcetype: &'a str,
     source: &'a str,
+    fields: EventFields<'a>,
     event: &'a RawValue,
+}
+
+#[derive(Serialize)]
+struct EventFields<'a> {
+    dbxrs_event_id: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -428,6 +427,7 @@ mod tests {
                     sourcetype: "dbx_rs:postgres:test".into(),
                     source: "dbx_rs:test".into(),
                 },
+                "stable-event-id",
             )
             .expect("event must encode");
         let value: serde_json::Value =
@@ -435,6 +435,7 @@ mod tests {
 
         assert_eq!(value["event"]["value"], 42);
         assert_eq!(value["index"], "dbx_rs_test");
+        assert_eq!(value["fields"]["dbxrs_event_id"], "stable-event-id");
         assert!(value["time"].as_f64().is_some_and(|time| time > 0.0));
         fs::remove_dir_all(root).expect("fixture must be removed");
     }
@@ -452,6 +453,7 @@ mod tests {
                     sourcetype: "dbx_rs:postgres:test".into(),
                     source: "dbx_rs:test".into(),
                 },
+                "stable-event-id",
             )
             .expect_err("invalid JSON must fail");
 

@@ -9,7 +9,7 @@ worker concurrency is capped at available CPU parallelism.
 ## Configuration
 
 `default/dbxrs_generic.conf` contains paths, operational log rotation, daemon scheduling limits,
-and HEC transport settings. Put overrides in `local/dbxrs_generic.conf`.
+encrypted spool quotas, and HEC transport settings. Put overrides in `local/dbxrs_generic.conf`.
 
 `default/dbxrs_inputs.conf` is intentionally empty. Put database stanzas in
 `local/dbxrs_inputs.conf`; see `README/dbxrs_inputs.conf.example` and the `.conf.spec` files. A
@@ -28,6 +28,45 @@ Validate the effective layered configuration without starting the daemon:
 $SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs config validate
 ```
 
+Validate one named input and its existing query, TLS, and protected credential assets without
+opening a database connection:
+
+```bash
+$SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs input validate example_postgres
+```
+
+Probe the configured database endpoint through the same connector and TLS path used by collection:
+
+```bash
+$SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs input probe example_postgres
+```
+
+Run a bounded read-only query test from standard input, keeping SQL out of process arguments and
+shell history:
+
+```bash
+printf '%s\n' 'SELECT current_database() AS database_name' | \
+  $SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs \
+  query test example_postgres --query-stdin --max-rows 1
+```
+
+An approved file already deployed under the connector asset directory is also accepted:
+
+```bash
+$SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs \
+  query test example_postgres \
+  --query-file "$SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/psql/health.sql"
+```
+
+Control-operation responses are compact JSON. An invalid named input returns its validation report
+and exit status 1; operation failures are JSON on standard error. Query tests accept one
+`SELECT`/`WITH` statement, execute inside a read-only transaction, and are capped at 100 rows,
+1,000,000 bytes, and 30 seconds. The named input's configured limits can lower those caps, and CLI
+limit options can lower them further but cannot raise them. Result rows are emitted only in the
+explicit command response; SQL and row payloads are not written to operational telemetry.
+The 30-second query-test deadline covers validation, asset/credential loading, connection setup,
+execution, and response conversion. Connection probes have a separate 30-second end-to-end cap.
+
 Store a credential without placing it in process arguments, environment variables, or config:
 
 ```bash
@@ -41,10 +80,12 @@ The key is generated locally and is not embedded in the binary. Back up the mast
 encrypted secret directory together; losing the key makes the secrets unrecoverable.
 
 Transient daemon files live under `$SPLUNK_HOME/var/run/splunk/dbx-rs`; persistent generated state
-and identity live under `$SPLUNK_HOME/var/lib/splunk/dbx-rs`. A future durable delivery spool must
-also live under Splunk's `var` tree when implemented. Generated path settings are rejected unless
-they resolve under `$SPLUNK_HOME/var`. The daemon does not generate files under `local/` except the
-managed HEC `inputs.conf` that Splunk itself requires in the configuration layer.
+and identity live under `$SPLUNK_HOME/var/lib/splunk/dbx-rs`. The encrypted spool, its separate
+installation key, and checkpoint repository also live below that persistent Splunk `var` tree.
+Generated path settings are rejected unless they resolve under `$SPLUNK_HOME/var`. The daemon does
+not generate files under `local/` except the managed HEC `inputs.conf` that Splunk itself requires
+in the configuration layer. Back up the spool key together with retained spool files; losing that
+key makes those segments intentionally unreadable.
 
 ## HEC bootstrap
 
@@ -69,9 +110,10 @@ and token. Subsequent daemon starts reuse the same identity and reconciliation i
 
 ## Operational telemetry
 
-Daemon, config-reload, connector, and HEC-delivery operations append one NDJSON object per lifecycle
-event to `$SPLUNK_HOME/var/log/splunk/dbx-trace.log`. The `dbx_rs:trace:json` sourcetype sends these
-events to `_internal` and uses numeric `timestamp_epoch` as event time.
+Daemon, config-reload, connector, HEC-delivery, and administrative control operations append one
+NDJSON object per lifecycle event to `$SPLUNK_HOME/var/log/splunk/dbx-trace.log`. The
+`dbx_rs:trace:json` sourcetype sends these events to `_internal` and uses numeric `timestamp_epoch`
+as event time.
 
 Schema version 2 includes status, request ID, component, connector, operation, safe input-stanza
 name, TLS mode, duration, configured limits, row and byte counters, throughput, publish state, and
@@ -89,14 +131,34 @@ the trace has no checkpoint or data-delivery role.
 
 ## Delivery boundary
 
-HEC is the default daemon output. Batches are bounded, retried three times with short backoff, and
-can wait for indexer acknowledgment. Database rows are streamed through a bounded channel, so slow
-HEC applies backpressure instead of allowing unbounded memory growth.
+HEC is the default daemon output. Before a query starts, the daemon reserves one complete segment
+against per-input and global quotas. Final HEC envelopes stream into independently authenticated
+encrypted frames. The footer and file are synchronized before the segment is atomically renamed
+from `.open` to `.ready`; only then can delivery begin. Connector failure aborts the unsealed file.
+Quota exhaustion stops new queries and never deletes ready data.
 
-The durable disk spool and database checkpoints are not implemented yet. A failure after an earlier
-batch was accepted can replay those rows on the next query, and a changing source query can still
-have gaps without a cursor protocol. Do not treat this slice as production end-to-end at-least-once
-collection until spool and checkpoint state machines are added.
+Each delivery cycle submits a bounded HEC request once and leaves the exact segment ready on any
+failure. Startup authenticates and replays ready segments before scheduling more database work.
+With indexer acknowledgment enabled, a segment becomes delivered only after all requests are
+acknowledged. Without it, HTTP acceptance is the configured weaker boundary. A crash or lost
+response after Splunk accepted data but before the local lifecycle rename can replay the same event,
+so this is durable at-least-once delivery rather than universal exactly-once delivery. Every frozen
+HEC envelope carries a stable `dbxrs_event_id` field derived from opaque input, batch, and row
+identities so downstream searches can identify replay duplicates without changing the database row.
+
+The connector and native adapter implement a typed timestamp-plus-ID cursor and return an
+uncommitted checkpoint candidate plus a distinct scan-resume cursor for bounded overlap pages. The
+versioned checkpoint repository can persist delivery-gated cursor and scan state with atomic
+revision fencing and explicit backup restore, but scheduled rising inputs do not use it yet. The
+current scheduler remains batch-only; no persistent database cursor advances. Do not configure a
+batch query that depends on rising semantics until that final coordinator integration is released.
+
+The spool and checkpoint formats are persistent. To roll back, stop the daemon and preserve the
+complete spool root, spool key, and `state_dir`. A binary that does not understand format v1 must
+not touch those files. Restore a format-v1-capable binary with the matching state and key, then
+validate both inventories before collection resumes; deleting retained data is not a rollback
+procedure. Upgrade preflight also validates that each input's row and byte limits fit one complete
+configured spool segment; lower those limits or raise the bounded segment limit before restarting.
 
 ## Query-path upgrade and rollback
 

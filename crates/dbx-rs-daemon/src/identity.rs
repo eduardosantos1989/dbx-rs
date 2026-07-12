@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use dbx_rs_secure_store::{read_limited, write_new};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, date_time_ymd,
@@ -7,7 +8,6 @@ use rcgen::{
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::error::DaemonError;
-use crate::secure_fs::{read_limited, write_new};
 
 const TOKEN_BYTES: usize = 36;
 const MAX_PEM_BYTES: u64 = 64 * 1024;
@@ -30,7 +30,7 @@ impl HecToken {
         match write_new(path, token.as_bytes(), 0o600) {
             Ok(()) => Self::from_bytes(token.into_bytes()),
             Err(_) if path.exists() => Self::load(path),
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -46,6 +46,18 @@ impl Drop for HecToken {
 }
 
 pub(crate) fn generate_uuid() -> Result<String, DaemonError> {
+    let random = generate_uuid_bytes()?;
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        hex(&random[0..4]),
+        hex(&random[4..6]),
+        hex(&random[6..8]),
+        hex(&random[8..10]),
+        hex(&random[10..16])
+    ))
+}
+
+pub(crate) fn generate_uuid_bytes() -> Result<[u8; 16], DaemonError> {
     let mut random = [0_u8; 16];
     SystemRandom::new().fill(&mut random).map_err(|_| {
         DaemonError::new(
@@ -59,14 +71,7 @@ pub(crate) fn generate_uuid() -> Result<String, DaemonError> {
     })?;
     random[6] = (random[6] & 0x0f) | 0x40;
     random[8] = (random[8] & 0x3f) | 0x80;
-    Ok(format!(
-        "{}-{}-{}-{}-{}",
-        hex(&random[0..4]),
-        hex(&random[4..6]),
-        hex(&random[6..8]),
-        hex(&random[8..10]),
-        hex(&random[10..16])
-    ))
+    Ok(random)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -121,7 +126,7 @@ pub fn ensure_hec_certificate(server_path: &Path, ca_path: &Path) -> Result<bool
             write_new(ca_path, ca_pem.as_bytes(), 0o644)?;
             if let Err(error) = write_new(server_path, server_pem.as_bytes(), 0o600) {
                 let _ignored = std::fs::remove_file(ca_path);
-                return Err(error);
+                return Err(error.into());
             }
             Ok(true)
         }

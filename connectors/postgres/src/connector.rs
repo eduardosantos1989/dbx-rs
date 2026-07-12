@@ -1,10 +1,12 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use dbx_rs_connector_sdk::{
-    CollectionResult, ConnectionConfig, ConnectorError, ErrorClass, ProbeReport, ResolvedSecret,
-    TlsMode, ValidationIssue, ValidationReport, ValidationSeverity,
+    AuthenticationMethod, CONNECTOR_CONTRACT_VERSION, ConnectionConfig, Connector,
+    ConnectorCapability, ConnectorDescriptor, ConnectorError, ConnectorFuture, ErrorClass,
+    ExecuteRequest, ExecutionResult, PrepareRequest, PreparedQuery, ProbeReport, ProbeRequest,
+    ResolvedSecret, TimestampIdCursorBound, TimestampIdCursorRequest, TlsMode, ValidationIssue,
+    ValidationReport, ValidationRequest, ValidationSeverity,
 };
-use futures_util::TryStreamExt;
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, pem::PemObject},
@@ -13,24 +15,36 @@ use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
-use tokio_postgres::{Client, NoTls, config::SslMode, tls::MakeTlsConnect, types::ToSql};
+use tokio_postgres::{Client, NoTls, config::SslMode, tls::MakeTlsConnect};
 use tokio_postgres_rustls::MakeRustlsConnect;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+
+mod typed;
 
 pub struct PostgresConnector;
 
-pub struct JsonCollectionRequest {
-    pub request_id: String,
-    pub query: String,
-    pub max_rows: u64,
-    pub max_bytes: u64,
-    pub timeout: Duration,
-}
-
 impl PostgresConnector {
     pub const CONNECTOR_ID: &'static str = "postgres";
-    const MAX_JSON_COLLECTION_ROWS: u64 = 100_000;
-    const MAX_JSON_COLLECTION_BYTES: u64 = 1024 * 1024 * 1024;
+    const MAX_COLLECTION_ROWS: u64 = 100_000;
+    pub(super) const MAX_OPERATION_TIMEOUT: Duration = Duration::from_hours(24);
+
+    #[must_use]
+    pub fn descriptor(&self) -> ConnectorDescriptor {
+        ConnectorDescriptor {
+            contract_version: CONNECTOR_CONTRACT_VERSION,
+            connector_id: Self::CONNECTOR_ID.into(),
+            connector_version: env!("CARGO_PKG_VERSION").into(),
+            database_families: vec!["postgresql".into()],
+            capabilities: vec![
+                ConnectorCapability::ValidateConfiguration,
+                ConnectorCapability::ProbeConnection,
+                ConnectorCapability::PrepareQuery,
+                ConnectorCapability::ExecuteQuery,
+            ],
+            authentication_methods: vec![AuthenticationMethod::Password],
+            build_id: format!("{}-{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        }
+    }
 
     /// Validates connectivity and returns the `PostgreSQL` product and version.
     ///
@@ -44,7 +58,7 @@ impl PostgresConnector {
         secret: &ResolvedSecret,
         cancellation: CancellationToken,
     ) -> Result<ProbeReport, ConnectorError> {
-        let report = Self::validation_report(config);
+        let report = Self::validate_connection(config);
         if !report.is_valid() {
             return Err(Self::invalid_configuration(&report));
         }
@@ -61,7 +75,40 @@ impl PostgresConnector {
         Self::authenticate_and_probe(config, secret, &cancellation).await
     }
 
-    fn validation_report(config: &ConnectionConfig) -> ValidationReport {
+    /// Prepares a bounded query and returns its connector-neutral schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error for invalid configuration, connection, query, schema,
+    /// cancellation, or timeout failures.
+    pub async fn prepare(
+        &self,
+        request: PrepareRequest,
+        secret: &ResolvedSecret,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedQuery, ConnectorError> {
+        typed::prepare(request, secret, cancellation).await
+    }
+
+    /// Executes a bounded query and emits self-contained Arrow IPC batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error for invalid configuration, connection, query, conversion,
+    /// limits, cancellation, output closure, or timeout failures.
+    pub async fn execute(
+        &self,
+        request: ExecuteRequest,
+        secret: &ResolvedSecret,
+        batch_tx: mpsc::Sender<dbx_rs_connector_sdk::ArrowIpcBatch>,
+        cancellation: CancellationToken,
+    ) -> Result<ExecutionResult, ConnectorError> {
+        typed::execute(request, secret, batch_tx, cancellation).await
+    }
+
+    /// Validates a `PostgreSQL` connection description without opening a network connection.
+    #[must_use]
+    pub fn validate_connection(config: &ConnectionConfig) -> ValidationReport {
         let mut issues = Vec::new();
 
         if config.connector_id != Self::CONNECTOR_ID {
@@ -99,20 +146,18 @@ impl PostgresConnector {
                 "username is required",
             ));
         }
-        if config.connect_timeout.is_zero() {
-            issues.push(validation_error(
-                "DBX-RS-PG-CFG-0006",
-                "connect_timeout",
-                "connect_timeout must be greater than zero",
-            ));
-        }
-        if config.probe_timeout.is_zero() {
-            issues.push(validation_error(
-                "DBX-RS-PG-CFG-0007",
-                "probe_timeout",
-                "probe_timeout must be greater than zero",
-            ));
-        }
+        issues.extend(timeout_issue(
+            config.connect_timeout,
+            "connect_timeout",
+            "DBX-RS-PG-CFG-0006",
+            "DBX-RS-PG-CFG-0012",
+        ));
+        issues.extend(timeout_issue(
+            config.probe_timeout,
+            "probe_timeout",
+            "DBX-RS-PG-CFG-0007",
+            "DBX-RS-PG-CFG-0013",
+        ));
         match config.tls_mode {
             TlsMode::Disable => {
                 if config.tls_server_name.is_some() || config.tls_ca_pem.is_some() {
@@ -159,6 +204,16 @@ impl PostgresConnector {
         ValidationReport { issues }
     }
 
+    /// Validates one bounded read query without opening a network connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified configuration error when the query is empty, contains multiple
+    /// statements, is not a `SELECT`/`WITH` query, or has an invalid row limit.
+    pub fn validate_query(query: &str, max_rows: u64) -> Result<(), ConnectorError> {
+        normalize_read_query(query, max_rows).map(|_| ())
+    }
+
     fn invalid_configuration(report: &ValidationReport) -> ConnectorError {
         let first_code = report
             .issues
@@ -171,6 +226,26 @@ impl PostgresConnector {
             false,
             true,
         )
+    }
+
+    fn validate_operation(
+        config: &ConnectionConfig,
+        secret: &ResolvedSecret,
+    ) -> Result<(), ConnectorError> {
+        let report = Self::validate_connection(config);
+        if !report.is_valid() {
+            return Err(Self::invalid_configuration(&report));
+        }
+        if secret.is_empty() {
+            return Err(ConnectorError::new(
+                "DBX-RS-PG-AUTH-0001",
+                ErrorClass::Configuration,
+                "PostgreSQL password is empty",
+                false,
+                true,
+            ));
+        }
+        Ok(())
     }
 
     async fn resolve(
@@ -226,7 +301,17 @@ impl PostgresConnector {
         addresses: Vec<SocketAddr>,
         cancellation: &CancellationToken,
     ) -> Result<(TcpStream, SocketAddr), ConnectorError> {
-        let deadline = Instant::now() + config.connect_timeout;
+        let deadline = Instant::now()
+            .checked_add(config.connect_timeout)
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    "DBX-RS-PG-CFG-0018",
+                    ErrorClass::Configuration,
+                    "PostgreSQL connection timeout cannot be represented",
+                    false,
+                    true,
+                )
+            })?;
 
         for address in addresses {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -345,7 +430,7 @@ impl PostgresConnector {
         secret: &ResolvedSecret,
         application_name: &str,
         cancellation: &CancellationToken,
-    ) -> Result<(Client, JoinHandle<()>, SocketAddr), ConnectorError> {
+    ) -> Result<(Client, AbortOnDropHandle<()>, SocketAddr), ConnectorError> {
         let addresses = Self::resolve(config, cancellation).await?;
         let (stream, endpoint) = Self::connect_tcp(config, addresses, cancellation).await?;
         let mut postgres_config = tokio_postgres::Config::new();
@@ -361,75 +446,7 @@ impl PostgresConnector {
             .application_name(application_name);
         let (client, connection_task) =
             Self::establish_client(config, postgres_config, stream, cancellation).await?;
-        Ok((client, connection_task, endpoint))
-    }
-
-    /// Streams a bounded read query as one UTF-8 JSON object per channel message.
-    ///
-    /// # Errors
-    ///
-    /// Returns a classified connector error when configuration, connection, query execution,
-    /// conversion, cancellation, timeout, or output delivery fails.
-    pub async fn collect_json_lines(
-        &self,
-        config: &ConnectionConfig,
-        secret: &ResolvedSecret,
-        request: JsonCollectionRequest,
-        line_tx: mpsc::Sender<Vec<u8>>,
-        cancellation: CancellationToken,
-    ) -> Result<CollectionResult, ConnectorError> {
-        let report = Self::validation_report(config);
-        if !report.is_valid() {
-            return Err(Self::invalid_configuration(&report));
-        }
-        if secret.is_empty() {
-            return Err(ConnectorError::new(
-                "DBX-RS-PG-AUTH-0001",
-                ErrorClass::Configuration,
-                "PostgreSQL password is empty",
-                false,
-                true,
-            ));
-        }
-        validate_collection_request(&request)?;
-        let query = normalize_collection_query(&request.query, request.max_rows)?;
-        let JsonCollectionRequest {
-            request_id,
-            max_bytes,
-            timeout: collection_timeout,
-            ..
-        } = request;
-        let (client, connection_task, _endpoint) =
-            Self::open_client(config, secret, "dbx-rs/postgres-collection", &cancellation).await?;
-
-        let collect = async {
-            let (rows_read, bytes_read) =
-                stream_json_lines(&client, &query, max_bytes, line_tx).await?;
-
-            Ok(CollectionResult {
-                request_id,
-                rows_read,
-                bytes_read,
-            })
-        };
-
-        let result = tokio::select! {
-            () = cancellation.cancelled() => {
-                Err(ConnectorError::cancelled("DBX-RS-PG-CANCELLED-0010"))
-            }
-            result = timeout(collection_timeout, collect) => {
-                result.map_err(|_| ConnectorError::new(
-                    "DBX-RS-PG-QUERY-0010",
-                    ErrorClass::Timeout,
-                    "PostgreSQL collection timed out",
-                    true,
-                    false,
-                ))?
-            }
-        };
-        drop(client);
-        connection_task.abort();
-        result
+        Ok((client, AbortOnDropHandle::new(connection_task), endpoint))
     }
 
     async fn establish_client(
@@ -506,106 +523,84 @@ impl PostgresConnector {
     }
 }
 
-fn validate_collection_request(request: &JsonCollectionRequest) -> Result<(), ConnectorError> {
-    if request.request_id.trim().is_empty() {
-        return Err(ConnectorError::new(
-            "DBX-RS-PG-CFG-0012",
-            ErrorClass::Configuration,
-            "collection request ID is required",
-            false,
-            true,
-        ));
+impl Connector for PostgresConnector {
+    fn descriptor(&self) -> ConnectorDescriptor {
+        PostgresConnector::descriptor(self)
     }
-    if request.timeout.is_zero() {
-        return Err(ConnectorError::new(
-            "DBX-RS-PG-CFG-0013",
-            ErrorClass::Configuration,
-            "collection timeout must be greater than zero",
-            false,
-            true,
-        ));
+
+    fn validate(&self, request: &ValidationRequest) -> ValidationReport {
+        let mut report = Self::validate_connection(&request.connection);
+        if let Some(query) = &request.query {
+            match request.max_rows {
+                Some(max_rows) => {
+                    if let Err(error) = Self::validate_query(query.as_str(), max_rows) {
+                        report.issues.push(ValidationIssue {
+                            code: error.code().to_owned(),
+                            field: "query".into(),
+                            message: "configured PostgreSQL query is invalid".into(),
+                            severity: ValidationSeverity::Error,
+                        });
+                    }
+                }
+                None => report.issues.push(validation_error(
+                    "DBX-RS-PG-CFG-0019",
+                    "max_rows",
+                    "max_rows is required when a query is validated",
+                )),
+            }
+        }
+        report
     }
-    if !(1..=PostgresConnector::MAX_JSON_COLLECTION_BYTES).contains(&request.max_bytes) {
-        return Err(ConnectorError::new(
-            "DBX-RS-PG-CFG-0018",
-            ErrorClass::Configuration,
-            format!(
-                "collection max_bytes must be between 1 and {}",
-                PostgresConnector::MAX_JSON_COLLECTION_BYTES
-            ),
-            false,
-            true,
-        ));
-    }
-    Ok(())
-}
 
-async fn stream_json_lines(
-    client: &Client,
-    query: &str,
-    max_bytes: u64,
-    line_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<(u64, u64), ConnectorError> {
-    client
-        .batch_execute("BEGIN TRANSACTION READ ONLY")
-        .await
-        .map_err(|error| classify_query_error(&error))?;
-
-    let parameters = std::iter::empty::<&(dyn ToSql + Sync)>();
-    let (rows_read, bytes_read) = {
-        let rows = client
-            .query_raw(query, parameters)
-            .await
-            .map_err(|error| classify_query_error(&error))?;
-        tokio::pin!(rows);
-
-        let mut rows_read = 0_u64;
-        let mut bytes_read = 0_u64;
-        while let Some(row) = rows
-            .try_next()
-            .await
-            .map_err(|error| classify_query_error(&error))?
-        {
-            let json = row.try_get::<_, String>(0).map_err(|_| {
-                ConnectorError::new(
-                    "DBX-RS-PG-CONVERT-0010",
-                    ErrorClass::Conversion,
-                    "PostgreSQL returned an invalid JSON row",
-                    false,
-                    false,
-                )
-            })?;
-            let line = json.into_bytes();
-            let next_bytes = bytes_read.saturating_add(line.len() as u64 + 1);
-            if next_bytes > max_bytes {
+    fn probe<'a>(
+        &'a self,
+        request: ProbeRequest,
+        secret: &'a ResolvedSecret,
+        cancellation: CancellationToken,
+    ) -> ConnectorFuture<'a, ProbeReport> {
+        Box::pin(async move {
+            if request.request_id.trim().is_empty() {
                 return Err(ConnectorError::new(
-                    "DBX-RS-PG-LIMIT-0001",
-                    ErrorClass::Query,
-                    "PostgreSQL collection exceeded the configured byte limit",
+                    "DBX-RS-PG-CFG-0030",
+                    ErrorClass::Configuration,
+                    "probe request ID is required",
                     false,
-                    false,
+                    true,
                 ));
             }
-            bytes_read = next_bytes;
-            rows_read = rows_read.saturating_add(1);
-            line_tx.send(line).await.map_err(|_| {
-                ConnectorError::new(
-                    "DBX-RS-PG-OUTPUT-0001",
-                    ErrorClass::Internal,
-                    "JSON row receiver closed",
-                    false,
-                    false,
-                )
-            })?;
-        }
-        (rows_read, bytes_read)
-    };
+            PostgresConnector::probe(self, &request.connection, secret, cancellation).await
+        })
+    }
 
-    client
-        .batch_execute("COMMIT")
-        .await
-        .map_err(|error| classify_query_error(&error))?;
-    Ok((rows_read, bytes_read))
+    fn prepare<'a>(
+        &'a self,
+        request: PrepareRequest,
+        secret: &'a ResolvedSecret,
+        cancellation: CancellationToken,
+    ) -> ConnectorFuture<'a, PreparedQuery> {
+        Box::pin(PostgresConnector::prepare(
+            self,
+            request,
+            secret,
+            cancellation,
+        ))
+    }
+
+    fn execute<'a>(
+        &'a self,
+        request: ExecuteRequest,
+        secret: &'a ResolvedSecret,
+        batch_tx: mpsc::Sender<dbx_rs_connector_sdk::ArrowIpcBatch>,
+        cancellation: CancellationToken,
+    ) -> ConnectorFuture<'a, ExecutionResult> {
+        Box::pin(PostgresConnector::execute(
+            self,
+            request,
+            secret,
+            batch_tx,
+            cancellation,
+        ))
+    }
 }
 
 fn validation_error(code: &str, field: &str, message: &str) -> ValidationIssue {
@@ -614,6 +609,29 @@ fn validation_error(code: &str, field: &str, message: &str) -> ValidationIssue {
         field: field.into(),
         message: message.into(),
         severity: ValidationSeverity::Error,
+    }
+}
+
+fn timeout_issue(
+    timeout: Duration,
+    field: &str,
+    zero_code: &str,
+    hard_limit_code: &str,
+) -> Option<ValidationIssue> {
+    if timeout.is_zero() {
+        Some(validation_error(
+            zero_code,
+            field,
+            "timeout must be greater than zero",
+        ))
+    } else if timeout > PostgresConnector::MAX_OPERATION_TIMEOUT {
+        Some(validation_error(
+            hard_limit_code,
+            field,
+            "timeout exceeds the connector hard limit",
+        ))
+    } else {
+        None
     }
 }
 
@@ -746,14 +764,85 @@ fn classify_query_error(error: &tokio_postgres::Error) -> ConnectorError {
     )
 }
 
-fn normalize_collection_query(query: &str, max_rows: u64) -> Result<String, ConnectorError> {
-    if !(1..=PostgresConnector::MAX_JSON_COLLECTION_ROWS).contains(&max_rows) {
+struct NormalizedTypedQuery {
+    base: String,
+    sql: String,
+    cursor_bound: Option<TimestampIdCursorBound>,
+}
+
+fn normalize_typed_query(
+    query: &str,
+    max_rows: u64,
+    cursor: Option<&TimestampIdCursorRequest>,
+) -> Result<NormalizedTypedQuery, ConnectorError> {
+    let base = normalize_read_query(query, max_rows)?;
+    let fetch_rows = max_rows.saturating_add(1);
+    let Some(cursor) = cursor else {
+        return Ok(NormalizedTypedQuery {
+            sql: format!("SELECT * FROM ({base}) AS dbx_rs_row LIMIT {fetch_rows}"),
+            base,
+            cursor_bound: None,
+        });
+    };
+
+    let cursor_bound = cursor.effective_bound().map_err(|_| {
+        ConnectorError::new(
+            "DBX-RS-PG-CFG-0046",
+            ErrorClass::Configuration,
+            "PostgreSQL cursor specification or bound is invalid",
+            false,
+            true,
+        )
+    })?;
+    if cursor.spec.timestamp_field.contains('\0') || cursor.spec.id_field.contains('\0') {
+        return Err(ConnectorError::new(
+            "DBX-RS-PG-CFG-0046",
+            ErrorClass::Configuration,
+            "PostgreSQL cursor specification or bound is invalid",
+            false,
+            true,
+        ));
+    }
+
+    let timestamp_field = quote_postgres_identifier(&cursor.spec.timestamp_field);
+    let id_field = quote_postgres_identifier(&cursor.spec.id_field);
+    let predicate = cursor_bound.map_or_else(String::new, |bound| {
+        let operator = if bound.inclusive { ">=" } else { ">" };
+        format!(
+            " WHERE (dbx_rs_row.{timestamp_field} IS NULL OR dbx_rs_row.{id_field} IS NULL OR (dbx_rs_row.{timestamp_field}, dbx_rs_row.{id_field}) {operator} ($1, $2))"
+        )
+    });
+    let sql = format!(
+        "SELECT * FROM ({base}) AS dbx_rs_row{predicate} ORDER BY dbx_rs_row.{timestamp_field} ASC NULLS FIRST, dbx_rs_row.{id_field} ASC NULLS FIRST LIMIT {fetch_rows}"
+    );
+    Ok(NormalizedTypedQuery {
+        base,
+        sql,
+        cursor_bound,
+    })
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    let mut quoted = String::with_capacity(identifier.len().saturating_add(2));
+    quoted.push('"');
+    for character in identifier.chars() {
+        if character == '"' {
+            quoted.push('"');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn normalize_read_query(query: &str, max_rows: u64) -> Result<String, ConnectorError> {
+    if !(1..=PostgresConnector::MAX_COLLECTION_ROWS).contains(&max_rows) {
         return Err(ConnectorError::new(
             "DBX-RS-PG-CFG-0014",
             ErrorClass::Configuration,
             format!(
                 "collection max_rows must be between 1 and {}",
-                PostgresConnector::MAX_JSON_COLLECTION_ROWS
+                PostgresConnector::MAX_COLLECTION_ROWS
             ),
             false,
             true,
@@ -795,9 +884,7 @@ fn normalize_collection_query(query: &str, max_rows: u64) -> Result<String, Conn
         ));
     }
 
-    Ok(format!(
-        "SELECT row_to_json(dbx_rs_row)::text FROM ({query}) AS dbx_rs_row LIMIT {max_rows}"
-    ))
+    Ok(query.to_owned())
 }
 
 fn error_class_for_sql_state(sql_state: &str) -> ErrorClass {
@@ -813,6 +900,10 @@ fn error_class_for_sql_state(sql_state: &str) -> ErrorClass {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use dbx_rs_connector_sdk::{
+        CursorNullPolicy, TimestampIdCursor, TimestampIdCursorRequest, TimestampIdCursorSpec,
+    };
 
     use super::*;
 
@@ -833,21 +924,21 @@ mod tests {
 
     #[test]
     fn explicit_disabled_tls_is_valid_for_lab_probe() {
-        let report = PostgresConnector::validation_report(&config(TlsMode::Disable));
+        let report = PostgresConnector::validate_connection(&config(TlsMode::Disable));
 
         assert!(report.is_valid());
     }
 
     #[test]
     fn verified_tls_is_valid() {
-        let report = PostgresConnector::validation_report(&config(TlsMode::VerifyFull));
+        let report = PostgresConnector::validate_connection(&config(TlsMode::VerifyFull));
 
         assert!(report.is_valid());
     }
 
     #[test]
     fn weaker_tls_mode_fails_closed() {
-        let report = PostgresConnector::validation_report(&config(TlsMode::Require));
+        let report = PostgresConnector::validate_connection(&config(TlsMode::Require));
 
         assert!(!report.is_valid());
         assert_eq!(report.issues[0].code, "DBX-RS-PG-CFG-0008");
@@ -858,10 +949,23 @@ mod tests {
         let mut config = config(TlsMode::VerifyFull);
         config.tls_ca_pem = Some(b"not a PEM certificate".to_vec());
 
-        let report = PostgresConnector::validation_report(&config);
+        let report = PostgresConnector::validate_connection(&config);
 
         assert!(!report.is_valid());
         assert_eq!(report.issues[0].code, "DBX-RS-PG-CFG-0011");
+    }
+
+    #[test]
+    fn connection_timeouts_above_the_hard_limit_are_rejected() {
+        let mut config = config(TlsMode::VerifyFull);
+        config.connect_timeout = PostgresConnector::MAX_OPERATION_TIMEOUT + Duration::from_secs(1);
+        config.probe_timeout = PostgresConnector::MAX_OPERATION_TIMEOUT + Duration::from_secs(1);
+
+        let report = PostgresConnector::validate_connection(&config);
+
+        assert_eq!(report.issues.len(), 2);
+        assert_eq!(report.issues[0].code, "DBX-RS-PG-CFG-0012");
+        assert_eq!(report.issues[1].code, "DBX-RS-PG-CFG-0013");
     }
 
     #[test]
@@ -873,19 +977,110 @@ mod tests {
     }
 
     #[test]
-    fn collection_query_is_wrapped_with_hard_row_limit() {
-        let query = normalize_collection_query(" SELECT 1 AS value;\n", 25)
+    fn typed_query_is_wrapped_with_hard_row_limit_and_truncation_probe() {
+        let query = normalize_typed_query(" SELECT 1 AS value;\n", 25, None)
             .expect("read query must be accepted");
 
         assert_eq!(
-            query,
-            "SELECT row_to_json(dbx_rs_row)::text FROM (SELECT 1 AS value) AS dbx_rs_row LIMIT 25"
+            query.sql,
+            "SELECT * FROM (SELECT 1 AS value) AS dbx_rs_row LIMIT 26"
         );
+        assert_eq!(query.base, "SELECT 1 AS value");
+        assert!(query.cursor_bound.is_none());
+    }
+
+    fn cursor_request(
+        timestamp_field: &str,
+        id_field: &str,
+        overlap: Duration,
+        committed: Option<TimestampIdCursor>,
+    ) -> TimestampIdCursorRequest {
+        TimestampIdCursorRequest {
+            spec: TimestampIdCursorSpec {
+                timestamp_field: timestamp_field.into(),
+                id_field: id_field.into(),
+                overlap,
+                null_policy: CursorNullPolicy::Reject,
+            },
+            committed,
+            resume_after: None,
+        }
+    }
+
+    #[test]
+    fn cursor_query_quotes_output_aliases_and_binds_an_exclusive_tuple() {
+        let cursor = cursor_request(
+            "updated\"at",
+            "row id",
+            Duration::ZERO,
+            Some(TimestampIdCursor::new(1_234_567_890, 9_876_543_210)),
+        );
+
+        let query = normalize_typed_query("SELECT * FROM events", 10, Some(&cursor))
+            .expect("cursor query must be accepted");
+
+        assert_eq!(
+            query.sql,
+            "SELECT * FROM (SELECT * FROM events) AS dbx_rs_row WHERE (dbx_rs_row.\"updated\"\"at\" IS NULL OR dbx_rs_row.\"row id\" IS NULL OR (dbx_rs_row.\"updated\"\"at\", dbx_rs_row.\"row id\") > ($1, $2)) ORDER BY dbx_rs_row.\"updated\"\"at\" ASC NULLS FIRST, dbx_rs_row.\"row id\" ASC NULLS FIRST LIMIT 11"
+        );
+        assert!(!query.sql.contains("1234567890"));
+        assert!(!query.sql.contains("9876543210"));
+        assert!(query.cursor_bound.is_some_and(|bound| !bound.inclusive));
+    }
+
+    #[test]
+    fn overlap_cursor_uses_an_inclusive_native_parameter_predicate() {
+        let cursor = cursor_request(
+            "updated_at",
+            "id",
+            Duration::from_secs(2),
+            Some(TimestampIdCursor::new(10_000_000, 77)),
+        );
+
+        let query = normalize_typed_query("SELECT updated_at, id FROM events", 5, Some(&cursor))
+            .expect("overlap cursor query must be accepted");
+
+        assert!(query.sql.contains(") >= ($1, $2)"));
+        assert!(
+            query.sql.contains(
+                "WHERE (dbx_rs_row.\"updated_at\" IS NULL OR dbx_rs_row.\"id\" IS NULL OR"
+            )
+        );
+        assert!(!query.sql.contains("10000000"));
+        assert!(query.cursor_bound.is_some_and(|bound| bound.inclusive));
+    }
+
+    #[test]
+    fn cursor_without_committed_state_orders_without_parameters() {
+        let cursor = cursor_request("updated_at", "id", Duration::ZERO, None);
+
+        let query = normalize_typed_query("SELECT updated_at, id FROM events", 5, Some(&cursor))
+            .expect("initial cursor query must be accepted");
+
+        assert!(!query.sql.contains(" WHERE "));
+        assert!(!query.sql.contains("$1"));
+        assert!(
+            query
+                .sql
+                .contains("ORDER BY dbx_rs_row.\"updated_at\" ASC NULLS FIRST")
+        );
+        assert!(query.cursor_bound.is_none());
+    }
+
+    #[test]
+    fn invalid_cursor_specification_fails_before_sql_construction() {
+        let cursor = cursor_request("same", "same", Duration::ZERO, None);
+
+        let error = normalize_typed_query("SELECT 1", 5, Some(&cursor))
+            .err()
+            .expect("duplicate cursor fields must fail");
+
+        assert_eq!(error.code(), "DBX-RS-PG-CFG-0046");
     }
 
     #[test]
     fn collection_query_rejects_non_read_statement() {
-        let error = normalize_collection_query("DELETE FROM events", 25)
+        let error = normalize_read_query("DELETE FROM events", 25)
             .expect_err("write query must be rejected");
 
         assert_eq!(error.code(), "DBX-RS-PG-CFG-0017");
@@ -893,26 +1088,9 @@ mod tests {
 
     #[test]
     fn collection_query_rejects_out_of_range_limit() {
-        let error =
-            normalize_collection_query("SELECT 1", PostgresConnector::MAX_JSON_COLLECTION_ROWS + 1)
-                .expect_err("oversized limit must be rejected");
+        let error = normalize_read_query("SELECT 1", PostgresConnector::MAX_COLLECTION_ROWS + 1)
+            .expect_err("oversized limit must be rejected");
 
         assert_eq!(error.code(), "DBX-RS-PG-CFG-0014");
-    }
-
-    #[test]
-    fn collection_request_rejects_out_of_range_byte_limit() {
-        let request = JsonCollectionRequest {
-            request_id: "test-request".into(),
-            query: "SELECT 1".into(),
-            max_rows: 1,
-            max_bytes: PostgresConnector::MAX_JSON_COLLECTION_BYTES + 1,
-            timeout: Duration::from_secs(1),
-        };
-
-        let error = validate_collection_request(&request)
-            .expect_err("oversized byte limit must be rejected");
-
-        assert_eq!(error.code(), "DBX-RS-PG-CFG-0018");
     }
 }

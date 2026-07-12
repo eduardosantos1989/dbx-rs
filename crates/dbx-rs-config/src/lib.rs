@@ -12,7 +12,16 @@ const HARD_HEC_EVENT_BYTES: u64 = 10_000_000;
 const HARD_HEC_BATCH_BYTES: u64 = 10_000_000;
 const HARD_INPUT_ROWS: u64 = 100_000;
 const HARD_INPUT_BYTES: u64 = 1024 * 1024 * 1024;
-const HARD_INLINE_QUERY_BYTES: usize = 1024 * 1024;
+const HARD_SPOOL_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
+const HARD_SPOOL_INPUT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+const HARD_SPOOL_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const HARD_INTERVAL_SECONDS: u64 = 365 * 24 * 60 * 60;
+const HARD_OPERATION_SECONDS: u64 = 24 * 60 * 60;
+const SPOOL_EVENT_OVERHEAD_BYTES: u64 = 1_024;
+const SPOOL_FORMAT_OVERHEAD_BYTES: u64 = 4_096;
+
+pub const MAX_QUERY_BYTES: u64 = 1024 * 1024;
+pub const MAX_TLS_CA_BYTES: u64 = 1024 * 1024;
 
 const GENERIC_FILE: &str = "dbxrs_generic.conf";
 const INPUTS_FILE: &str = "dbxrs_inputs.conf";
@@ -29,6 +38,7 @@ pub struct GenericConfig {
     pub paths: PathsConfig,
     pub logging: LoggingConfig,
     pub daemon: DaemonConfig,
+    pub spool: SpoolConfig,
     pub hec: HecConfig,
 }
 
@@ -42,6 +52,9 @@ pub struct PathsConfig {
     pub hec_token_file: PathBuf,
     pub hec_server_pem_file: PathBuf,
     pub hec_ca_file: PathBuf,
+    pub spool_key_file: PathBuf,
+    pub state_dir: PathBuf,
+    pub spool_dir: PathBuf,
     pub managed_inputs_file: PathBuf,
 }
 
@@ -57,6 +70,13 @@ pub struct DaemonConfig {
     pub shutdown_grace: Duration,
     pub configuration_reload: Duration,
     pub max_workers: WorkerLimit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpoolConfig {
+    pub segment_max_bytes: u64,
+    pub input_max_bytes: u64,
+    pub total_max_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,6 +260,9 @@ fn validate_generic_keys(ini: &Ini) -> Result<(), ConfigError> {
                 "hec_token_file",
                 "hec_server_pem_file",
                 "hec_ca_file",
+                "spool_key_file",
+                "state_dir",
+                "spool_dir",
                 "managed_inputs_file",
             ],
         ),
@@ -252,6 +275,10 @@ fn validate_generic_keys(ini: &Ini) -> Result<(), ConfigError> {
                 "configuration_reload_secs",
                 "max_workers",
             ],
+        ),
+        (
+            "spool",
+            &["segment_max_bytes", "input_max_bytes", "total_max_bytes"],
         ),
         (
             "hec",
@@ -307,6 +334,9 @@ fn parse_generic(ini: &Ini, splunk_home: &Path) -> Result<GenericConfig, ConfigE
         hec_token_file: required_var_path(ini, "paths", "hec_token_file", splunk_home)?,
         hec_server_pem_file: required_var_path(ini, "paths", "hec_server_pem_file", splunk_home)?,
         hec_ca_file: required_var_path(ini, "paths", "hec_ca_file", splunk_home)?,
+        spool_key_file: required_var_path(ini, "paths", "spool_key_file", splunk_home)?,
+        state_dir: required_var_path(ini, "paths", "state_dir", splunk_home)?,
+        spool_dir: required_var_path(ini, "paths", "spool_dir", splunk_home)?,
         managed_inputs_file: required_path(ini, "paths", "managed_inputs_file", splunk_home)?,
     };
 
@@ -355,11 +385,33 @@ fn parse_generic(ini: &Ini, splunk_home: &Path) -> Result<GenericConfig, ConfigE
         max_workers,
     };
 
+    let segment_max_bytes = required_u64(ini, "spool", "segment_max_bytes")?;
+    if !(4_096..=HARD_SPOOL_SEGMENT_BYTES).contains(&segment_max_bytes) {
+        return Err(ConfigError::new(
+            "DBX-RS-CFG-0050",
+            "spool.segment_max_bytes",
+        ));
+    }
+    let input_max_bytes = required_u64(ini, "spool", "input_max_bytes")?;
+    if input_max_bytes < segment_max_bytes || input_max_bytes > HARD_SPOOL_INPUT_BYTES {
+        return Err(ConfigError::new("DBX-RS-CFG-0051", "spool.input_max_bytes"));
+    }
+    let total_max_bytes = required_u64(ini, "spool", "total_max_bytes")?;
+    if total_max_bytes < input_max_bytes || total_max_bytes > HARD_SPOOL_TOTAL_BYTES {
+        return Err(ConfigError::new("DBX-RS-CFG-0052", "spool.total_max_bytes"));
+    }
+    let spool = SpoolConfig {
+        segment_max_bytes,
+        input_max_bytes,
+        total_max_bytes,
+    };
+
     let hec = parse_hec(ini)?;
     Ok(GenericConfig {
         paths,
         logging,
         daemon,
+        spool,
         hec,
     })
 }
@@ -397,10 +449,11 @@ fn parse_hec(ini: &Ini) -> Result<HecConfig, ConfigError> {
     if !(1..=HARD_HEC_EVENT_BYTES).contains(&max_event_bytes) || max_event_bytes > batch_max_bytes {
         return Err(ConfigError::new("DBX-RS-CFG-0011", "hec.max_event_bytes"));
     }
-    let timeout = Duration::from_secs(required_u64(ini, "hec", "timeout_secs")?);
-    if timeout.is_zero() {
+    let timeout_secs = required_u64(ini, "hec", "timeout_secs")?;
+    if !(1..=HARD_OPERATION_SECONDS).contains(&timeout_secs) {
         return Err(ConfigError::new("DBX-RS-CFG-0034", "hec.timeout_secs"));
     }
+    let timeout = Duration::from_secs(timeout_secs);
     let verify_tls = required_bool(ini, "hec", "verify_tls")?;
     if !verify_tls
         && !url.starts_with("https://localhost:")
@@ -512,8 +565,16 @@ fn parse_input(
     if !(1..=HARD_INPUT_BYTES).contains(&max_bytes) {
         return Err(ConfigError::new("DBX-RS-CFG-0016", "input.max_bytes"));
     }
+    let required_segment_bytes = max_rows
+        .checked_mul(SPOOL_EVENT_OVERHEAD_BYTES)
+        .and_then(|overhead| overhead.checked_add(max_bytes))
+        .and_then(|bytes| bytes.checked_add(SPOOL_FORMAT_OVERHEAD_BYTES))
+        .ok_or_else(|| ConfigError::new("DBX-RS-CFG-0053", "input.spool_bound"))?;
+    if required_segment_bytes > generic.spool.segment_max_bytes {
+        return Err(ConfigError::new("DBX-RS-CFG-0053", "input.spool_bound"));
+    }
     let interval_secs = required_u64(ini, name, "interval_secs")?;
-    if interval_secs == 0 {
+    if !(1..=HARD_INTERVAL_SECONDS).contains(&interval_secs) {
         return Err(ConfigError::new("DBX-RS-CFG-0019", "input.interval_secs"));
     }
     let secret_ref = required(ini, name, "secret_ref")?;
@@ -562,10 +623,10 @@ fn parse_input(
         max_rows,
         max_bytes,
         query_timeout,
-        index: optional(ini, name, "index").unwrap_or_else(|| generic.hec.index.clone()),
-        sourcetype: optional(ini, name, "sourcetype")
+        index: optional_label(ini, name, "index")?.unwrap_or_else(|| generic.hec.index.clone()),
+        sourcetype: optional_label(ini, name, "sourcetype")?
             .unwrap_or_else(|| generic.hec.sourcetype.clone()),
-        source: optional(ini, name, "source").unwrap_or_else(|| generic.hec.source.clone()),
+        source: optional_label(ini, name, "source")?.unwrap_or_else(|| generic.hec.source.clone()),
     })
 }
 
@@ -589,7 +650,7 @@ fn parse_query_source(
         (Some(_), Some(_)) => Err(ConfigError::new("DBX-RS-CFG-0046", "input.query")),
         (None, None) => Err(ConfigError::new("DBX-RS-CFG-0045", "input.query")),
         (Some(query), None) => {
-            if query.len() > HARD_INLINE_QUERY_BYTES || query.contains('\0') {
+            if query.len() as u64 > MAX_QUERY_BYTES || query.contains('\0') {
                 return Err(ConfigError::new("DBX-RS-CFG-0047", "input.query"));
             }
             Ok(QuerySource::Inline(query))
@@ -639,6 +700,19 @@ fn required_label(ini: &Ini, section: &str, key: &'static str) -> Result<String,
     let value = required(ini, section, key)?;
     validate_label(&value, key)?;
     Ok(value)
+}
+
+fn optional_label(
+    ini: &Ini,
+    section: &str,
+    key: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    optional(ini, section, key)
+        .map(|value| {
+            validate_label(&value, key)?;
+            Ok(value)
+        })
+        .transpose()
 }
 
 fn validate_label(value: &str, field: &'static str) -> Result<(), ConfigError> {
@@ -694,7 +768,7 @@ fn required_nonzero_duration(
     key: &'static str,
 ) -> Result<Duration, ConfigError> {
     let seconds = required_u64(ini, section, key)?;
-    if seconds == 0 || seconds > 86_400 {
+    if !(1..=HARD_OPERATION_SECONDS).contains(&seconds) {
         return Err(ConfigError::new("DBX-RS-CFG-0038", key));
     }
     Ok(Duration::from_secs(seconds))
@@ -828,6 +902,9 @@ secret_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/credentials/secrets
 hec_token_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/token
 hec_server_pem_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/server.pem
 hec_ca_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/ca.pem
+spool_key_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/durable/spool.key
+state_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/state
+spool_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/spool
 managed_inputs_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/inputs.conf
 
 [logging]
@@ -839,6 +916,11 @@ poll_interval_ms = 1000
 shutdown_grace_secs = 30
 configuration_reload_secs = 5
 max_workers = auto
+
+[spool]
+segment_max_bytes = 10000000
+input_max_bytes = 100000000
+total_max_bytes = 1000000000
 
 [hec]
 enabled = true
@@ -928,6 +1010,123 @@ source = dbx_rs:heartbeat
     }
 
     #[test]
+    fn loads_bounded_spool_paths_and_quotas() {
+        let (root, app) = fixture();
+
+        let effective = load_effective_config(&app, &root).expect("config must load");
+
+        assert_eq!(
+            effective.generic.paths.spool_dir,
+            root.join("var/lib/splunk/dbx-rs/spool")
+        );
+        assert_eq!(effective.generic.spool.segment_max_bytes, 10_000_000);
+        assert_eq!(effective.generic.spool.input_max_bytes, 100_000_000);
+        assert_eq!(effective.generic.spool.total_max_bytes, 1_000_000_000);
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_inverted_spool_quota_hierarchy() {
+        let (root, app) = fixture();
+        fs::write(
+            app.join("local").join(GENERIC_FILE),
+            "[spool]\ninput_max_bytes = 9999999\n",
+        )
+        .expect("override must be written");
+
+        let error =
+            load_effective_config(&app, &root).expect_err("inverted spool quotas must fail");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0051");
+        assert_eq!(error.field(), "spool.input_max_bytes");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_input_that_cannot_fit_one_atomic_spool_segment() {
+        let (root, app) = fixture();
+        let oversized = input_config().replace("max_rows = 1000", "max_rows = 10000");
+        fs::write(app.join("default").join(INPUTS_FILE), oversized)
+            .expect("oversized input fixture must be written");
+
+        let error = load_effective_config(&app, &root)
+            .expect_err("input exceeding its atomic segment must fail");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0053");
+        assert_eq!(error.field(), "input.spool_bound");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn accepts_exact_atomic_spool_bound_and_rejects_one_byte_less() {
+        let (root, app) = fixture();
+        let exact = 1_048_576 + (1_000 * SPOOL_EVENT_OVERHEAD_BYTES) + SPOOL_FORMAT_OVERHEAD_BYTES;
+        fs::write(
+            app.join("local").join(GENERIC_FILE),
+            format!("[spool]\nsegment_max_bytes = {exact}\n"),
+        )
+        .expect("exact spool override must be written");
+
+        load_effective_config(&app, &root).expect("exact spool bound must load");
+
+        fs::write(
+            app.join("local").join(GENERIC_FILE),
+            format!("[spool]\nsegment_max_bytes = {}\n", exact - 1),
+        )
+        .expect("undersized spool override must be written");
+        let error = load_effective_config(&app, &root)
+            .expect_err("one byte below the spool bound must fail");
+        assert_eq!(error.code(), "DBX-RS-CFG-0053");
+        assert_eq!(error.field(), "input.spool_bound");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_invalid_per_input_hec_metadata_labels() {
+        for (field, value) in [
+            ("index", String::new()),
+            ("sourcetype", "a".repeat(MAX_LABEL_BYTES + 1)),
+            ("source", "invalid\u{7f}label".to_owned()),
+        ] {
+            let (root, app) = fixture();
+            let original = format!(
+                "{field} = {}",
+                match field {
+                    "index" => "dbx_rs_test",
+                    "sourcetype" => "dbx_rs:postgres:heartbeat",
+                    "source" => "dbx_rs:heartbeat",
+                    _ => unreachable!("test field is fixed"),
+                }
+            );
+            let invalid = input_config().replace(&original, &format!("{field} = {value}"));
+            fs::write(app.join("default").join(INPUTS_FILE), invalid)
+                .expect("invalid metadata fixture must be written");
+
+            let error = load_effective_config(&app, &root)
+                .expect_err("invalid per-input HEC metadata must fail");
+            assert_eq!(error.code(), "DBX-RS-CFG-0026");
+            assert_eq!(error.field(), field);
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+    }
+
+    #[test]
+    fn rejects_spool_path_outside_splunk_var() {
+        let (root, app) = fixture();
+        fs::write(
+            app.join("local").join(GENERIC_FILE),
+            "[paths]\nspool_dir = $SPLUNK_HOME/etc/apps/TA-dbx-rs/spool\n",
+        )
+        .expect("override must be written");
+
+        let error = load_effective_config(&app, &root).expect_err("app-local spool must fail");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0043");
+        assert_eq!(error.field(), "spool_dir");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
     fn rejects_plaintext_password_setting() {
         let (root, app) = fixture();
         let unsafe_input = input_config().replace(
@@ -954,6 +1153,49 @@ source = dbx_rs:heartbeat
 
         let error = load_effective_config(&app, &root).expect_err("obsolete setting must fail");
         assert_eq!(error.code(), "DBX-RS-CFG-0012");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_input_timeout_above_the_connector_hard_limit() {
+        let (root, app) = fixture();
+        let oversized =
+            input_config().replace("query_timeout_secs = 30", "query_timeout_secs = 86401");
+        fs::write(app.join("default").join(INPUTS_FILE), oversized)
+            .expect("input fixture must be written");
+
+        let error = load_effective_config(&app, &root).expect_err("oversized timeout must fail");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0038");
+        assert_eq!(error.field(), "query_timeout_secs");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_unrepresentable_scheduler_and_hec_durations() {
+        let (root, app) = fixture();
+        let oversized_interval = input_config().replace(
+            "interval_secs = 60",
+            &format!("interval_secs = {}", HARD_INTERVAL_SECONDS + 1),
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), oversized_interval)
+            .expect("interval fixture must be written");
+        let error = load_effective_config(&app, &root)
+            .expect_err("oversized scheduling interval must fail");
+        assert_eq!(error.code(), "DBX-RS-CFG-0019");
+        assert_eq!(error.field(), "input.interval_secs");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+
+        let (root, app) = fixture();
+        fs::write(
+            app.join("local").join(GENERIC_FILE),
+            format!("[hec]\ntimeout_secs = {}\n", HARD_OPERATION_SECONDS + 1),
+        )
+        .expect("HEC timeout fixture must be written");
+        let error =
+            load_effective_config(&app, &root).expect_err("oversized HEC timeout must fail");
+        assert_eq!(error.code(), "DBX-RS-CFG-0034");
+        assert_eq!(error.field(), "hec.timeout_secs");
         fs::remove_dir_all(root).expect("fixture must be removed");
     }
 

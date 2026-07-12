@@ -8,10 +8,15 @@ license.workspace = true
 publish = false
 
 [dependencies]
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
 dbx-rs-connector-sdk.workspace = true
 dbx-rs-telemetry.workspace = true
 futures-util.workspace = true
 rustls.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = [
     "macros",
     "net",
@@ -19,9 +24,10 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-tokio-postgres.workspace = true
+tokio-postgres = { workspace = true, features = ["with-chrono-0_4", "with-uuid-1"] }
 tokio-postgres-rustls.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 webpki-roots.workspace = true
 
 [[bin]]

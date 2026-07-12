@@ -1,0 +1,19 @@
+[package]
+name = "dbx-rs-state"
+description = "Durable checkpoint state storage for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dbx-rs-checkpoint.workspace = true
+dbx-rs-connector-sdk.workspace = true
+dbx-rs-secure-store.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,10 +1,16 @@
 [workspace]
 members = [
     "connectors/postgres",
+    "crates/dbx-rs-checkpoint",
     "crates/dbx-rs-cli",
     "crates/dbx-rs-config",
+    "crates/dbx-rs-control",
     "crates/dbx-rs-connector-sdk",
     "crates/dbx-rs-daemon",
+    "crates/dbx-rs-native-connectors",
+    "crates/dbx-rs-secure-store",
+    "crates/dbx-rs-spool",
+    "crates/dbx-rs-state",
     "crates/dbx-rs-telemetry",
 ]
 resolver = "3"
@@ -16,9 +22,19 @@ rust-version = "1.97"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+arrow-array = { version = "59.1.0", default-features = false }
+arrow-ipc = { version = "59.1.0", default-features = false }
+arrow-schema = { version = "59.1.0", default-features = false }
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 configparser = { version = "3.2.0", default-features = false }
+dbx-rs-checkpoint = { version = "0.1.0", path = "crates/dbx-rs-checkpoint" }
 dbx-rs-config = { version = "0.1.0", path = "crates/dbx-rs-config" }
+dbx-rs-control = { version = "0.1.0", path = "crates/dbx-rs-control" }
 dbx-rs-connector-sdk = { version = "0.1.0", path = "crates/dbx-rs-connector-sdk" }
+dbx-rs-native-connectors = { version = "0.1.0", path = "crates/dbx-rs-native-connectors" }
+dbx-rs-secure-store = { version = "0.1.0", path = "crates/dbx-rs-secure-store" }
+dbx-rs-spool = { version = "0.1.0", path = "crates/dbx-rs-spool" }
+dbx-rs-state = { version = "0.1.0", path = "crates/dbx-rs-state" }
 dbx-rs-telemetry = { version = "0.1.0", path = "crates/dbx-rs-telemetry" }
 futures-util = { version = "0.3.32", default-features = false }
 http = { version = "1.4.2", default-features = false }
@@ -32,6 +48,7 @@ tokio-postgres = { version = "0.7.18", default-features = false, features = ["ru
 tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+uuid = { version = "1.18.1", default-features = false, features = ["std"] }
 webpki-roots = { version = "1.0.8", default-features = false }
 
 [workspace.lints.rust]

@@ -9,6 +9,11 @@ publish = false
 
 [dependencies]
 dbx-rs-config.workspace = true
+dbx-rs-control.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "signal"] }
+tokio-util.workspace = true
 
 [[bin]]
 name = "dbx-rs"

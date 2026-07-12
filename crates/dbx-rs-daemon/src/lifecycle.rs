@@ -2,8 +2,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use dbx_rs_secure_store::{ensure_private_dir, read_limited};
+
 use crate::error::DaemonError;
-use crate::secure_fs::{ensure_private_dir, read_limited};
 
 #[derive(Debug)]
 pub struct InstanceGuard {

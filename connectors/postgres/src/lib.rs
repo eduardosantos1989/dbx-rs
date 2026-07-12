@@ -2,4 +2,4 @@
 
 mod connector;
 
-pub use connector::{JsonCollectionRequest, PostgresConnector};
+pub use connector::PostgresConnector;

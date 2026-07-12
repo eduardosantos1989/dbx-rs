@@ -4,8 +4,8 @@ use dbx_rs_connector_sdk::ResolvedSecret;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 
-use crate::error::DaemonError;
-use crate::secure_fs::{atomic_write, ensure_private_dir, read_limited, write_new};
+use crate::error::SecureStoreError;
+use crate::fs::{atomic_write, ensure_private_dir, read_limited, validate_private_dir, write_new};
 
 const MASTER_KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 12;
@@ -20,7 +20,12 @@ pub struct SecretStore {
 }
 
 impl SecretStore {
-    pub fn open(master_key_file: &Path, directory: &Path) -> Result<Self, DaemonError> {
+    /// Opens a writable store, creating its directory and master key when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when private storage cannot be created, protected, or read.
+    pub fn open(master_key_file: &Path, directory: &Path) -> Result<Self, SecureStoreError> {
         ensure_private_dir(directory)?;
         let key = if master_key_file.exists() {
             load_master_key(master_key_file)?
@@ -33,12 +38,35 @@ impl SecretStore {
         })
     }
 
-    pub fn set(&self, name: &str, mut secret: Vec<u8>) -> Result<(), DaemonError> {
+    /// Opens an existing store without creating or modifying files or directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the private directory or master key is missing, insecure, or invalid.
+    pub fn open_existing(
+        master_key_file: &Path,
+        directory: &Path,
+    ) -> Result<Self, SecureStoreError> {
+        validate_private_dir(directory)?;
+        let key = load_master_key(master_key_file)?;
+        Ok(Self {
+            key,
+            directory: directory.to_path_buf(),
+        })
+    }
+
+    /// Encrypts and atomically stores one named local secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name or value is invalid, encryption fails, or the protected file
+    /// cannot be written.
+    pub fn set(&self, name: &str, mut secret: Vec<u8>) -> Result<(), SecureStoreError> {
         validate_name(name)?;
         trim_line_endings(&mut secret);
         if secret.is_empty() || secret.len() > MAX_SECRET_BYTES {
             secret.fill(0);
-            return Err(DaemonError::new(
+            return Err(SecureStoreError::new(
                 "DBX-RS-SECRET-0001",
                 "configuration",
                 "secret_input",
@@ -51,7 +79,7 @@ impl SecretStore {
         let mut nonce_bytes = [0_u8; NONCE_BYTES];
         SystemRandom::new().fill(&mut nonce_bytes).map_err(|_| {
             secret.fill(0);
-            DaemonError::new(
+            SecureStoreError::new(
                 "DBX-RS-SECRET-0002",
                 "internal",
                 "secret_encrypt",
@@ -68,7 +96,7 @@ impl SecretStore {
         )
         .map_err(|_| {
             secret.fill(0);
-            DaemonError::new(
+            SecureStoreError::new(
                 "DBX-RS-SECRET-0003",
                 "internal",
                 "secret_encrypt",
@@ -88,9 +116,15 @@ impl SecretStore {
         result
     }
 
-    pub fn resolve(&self, reference: &str) -> Result<ResolvedSecret, DaemonError> {
+    /// Authenticates and decrypts one `local:<name>` secret reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reference or protected file is invalid, missing, oversized, or
+    /// cannot be authenticated and decrypted.
+    pub fn resolve(&self, reference: &str) -> Result<ResolvedSecret, SecureStoreError> {
         let name = reference.strip_prefix("local:").ok_or_else(|| {
-            DaemonError::new(
+            SecureStoreError::new(
                 "DBX-RS-SECRET-0004",
                 "configuration",
                 "secret_resolve",
@@ -143,10 +177,10 @@ impl Drop for SecretStore {
     }
 }
 
-fn create_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], DaemonError> {
+fn create_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], SecureStoreError> {
     let mut key = [0_u8; MASTER_KEY_BYTES];
     SystemRandom::new().fill(&mut key).map_err(|_| {
-        DaemonError::new(
+        SecureStoreError::new(
             "DBX-RS-SECRET-0005",
             "internal",
             "master_key_create",
@@ -168,11 +202,11 @@ fn create_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], DaemonError>
     }
 }
 
-fn load_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], DaemonError> {
+fn load_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], SecureStoreError> {
     let mut bytes = read_limited(path, MASTER_KEY_BYTES as u64)?;
     if bytes.len() != MASTER_KEY_BYTES {
         bytes.fill(0);
-        return Err(DaemonError::new(
+        return Err(SecureStoreError::new(
             "DBX-RS-SECRET-0006",
             "configuration",
             "master_key_load",
@@ -187,11 +221,11 @@ fn load_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], DaemonError> {
     Ok(key)
 }
 
-fn encryption_key(bytes: &[u8; MASTER_KEY_BYTES]) -> Result<LessSafeKey, DaemonError> {
+fn encryption_key(bytes: &[u8; MASTER_KEY_BYTES]) -> Result<LessSafeKey, SecureStoreError> {
     UnboundKey::new(&aead::CHACHA20_POLY1305, bytes)
         .map(LessSafeKey::new)
         .map_err(|_| {
-            DaemonError::new(
+            SecureStoreError::new(
                 "DBX-RS-SECRET-0007",
                 "internal",
                 "secret_crypto",
@@ -208,14 +242,14 @@ fn aad(name: &str) -> Vec<u8> {
     aad
 }
 
-fn validate_name(name: &str) -> Result<(), DaemonError> {
+fn validate_name(name: &str) -> Result<(), SecureStoreError> {
     if name.is_empty()
         || name.len() > 128
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
-        return Err(DaemonError::new(
+        return Err(SecureStoreError::new(
             "DBX-RS-SECRET-0008",
             "configuration",
             "secret_name",
@@ -233,8 +267,8 @@ fn trim_line_endings(bytes: &mut Vec<u8>) {
     }
 }
 
-const fn invalid_secret_file() -> DaemonError {
-    DaemonError::new(
+const fn invalid_secret_file() -> SecureStoreError {
+    SecureStoreError::new(
         "DBX-RS-SECRET-0009",
         "configuration",
         "secret_decrypt",
@@ -287,6 +321,48 @@ mod tests {
     }
 
     #[test]
+    fn existing_store_opens_and_resolves_without_rewriting_material() {
+        let root = test_dir();
+        let key_path = root.join("master.key");
+        let secret_dir = root.join("secrets");
+        let store = SecretStore::open(&key_path, &secret_dir).expect("store must open");
+        store
+            .set("warehouse", b"existing-secret".to_vec())
+            .expect("secret must be stored");
+        drop(store);
+        let key_before = fs::read(&key_path).expect("key must be readable");
+        let secret_before =
+            fs::read(secret_dir.join("warehouse.secret")).expect("secret must be readable");
+
+        let existing =
+            SecretStore::open_existing(&key_path, &secret_dir).expect("existing store must open");
+        let resolved = existing
+            .resolve("local:warehouse")
+            .expect("existing secret must resolve");
+
+        assert_eq!(resolved.expose_secret(), b"existing-secret");
+        assert_eq!(fs::read(&key_path).expect("key must remain"), key_before);
+        assert_eq!(
+            fs::read(secret_dir.join("warehouse.secret")).expect("secret must remain"),
+            secret_before
+        );
+        drop(resolved);
+        drop(existing);
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn existing_store_does_not_create_missing_material() {
+        let root = test_dir();
+        let error = SecretStore::open_existing(&root.join("master.key"), &root.join("secrets"))
+            .err()
+            .expect("missing store must fail closed");
+
+        assert_eq!(error.code(), "DBX-RS-FS-0018");
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn secret_name_is_bound_into_authentication() {
         let root = test_dir();
         let store = SecretStore::open(&root.join("master.key"), &root.join("secrets"))
@@ -334,5 +410,30 @@ mod tests {
         assert_eq!(secret_mode, 0o600);
         drop(store);
         fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_symlink_ancestors_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_dir();
+        let redirected = root.with_extension("redirected");
+        fs::create_dir_all(&root).expect("fixture root must be created");
+        fs::create_dir_all(&redirected).expect("redirect target must be created");
+        symlink(&redirected, root.join("nested")).expect("nested symlink must be created");
+
+        let error = SecretStore::open(
+            &root.join("nested/master.key"),
+            &root.join("nested/secrets"),
+        )
+        .err()
+        .expect("nested symlink must fail closed");
+
+        assert_eq!(error.code(), "DBX-RS-FS-0014");
+        assert!(!redirected.join("master.key").exists());
+        assert!(!redirected.join("secrets").exists());
+        fs::remove_dir_all(root).expect("fixture must be removed");
+        fs::remove_dir_all(redirected).expect("redirect target must be removed");
     }
 }

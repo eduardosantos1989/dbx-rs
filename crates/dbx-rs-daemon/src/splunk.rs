@@ -3,10 +3,10 @@ use std::path::Path;
 
 use configparser::ini::Ini;
 use dbx_rs_config::{HecConfig, HecInputManagement, HecState, IndexerAcknowledgment, InputConfig};
+use dbx_rs_secure_store::{atomic_write, read_limited};
 
 use crate::error::DaemonError;
 use crate::identity::HecToken;
-use crate::secure_fs::{atomic_write, read_limited};
 
 const MAX_INPUTS_CONF_BYTES: u64 = 1024 * 1024;
 

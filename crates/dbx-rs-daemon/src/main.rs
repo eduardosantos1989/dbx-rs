@@ -5,9 +5,8 @@ mod hec;
 mod identity;
 mod lifecycle;
 mod operational;
+mod prepared;
 mod runtime;
-mod secrets;
-mod secure_fs;
 mod splunk;
 mod worker;
 
@@ -18,9 +17,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use dbx_rs_config::load_effective_config;
+use dbx_rs_secure_store::SecretStore;
 
 use crate::error::DaemonError;
-use crate::secrets::SecretStore;
 
 const HELP: &str = "dbx-rs-daemon - Splunk-supervised database collection\n\
 \n\

@@ -1,0 +1,15 @@
+[package]
+name = "dbx-rs-secure-store"
+description = "Secure local file and credential storage for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dbx-rs-connector-sdk.workspace = true
+ring.workspace = true
+
+[lints]
+workspace = true

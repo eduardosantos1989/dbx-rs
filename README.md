@@ -8,17 +8,39 @@ database driver for certified native connectors.
 ## Status
 
 The project is at an early vertical-slice stage. The PostgreSQL connector validates configuration,
-probes with verified Rustls TLS, and streams bounded JSON rows. A singleton daemon is supervised as a
-continuous Splunk scripted input, loads typed layered configuration, keeps database credentials in
-an installation-specific authenticated encrypted store, and sends CPU-bounded non-overlapping input
-runs to verified local HEC. It can generate and reconcile a stable local HEC token and certificate
-without Splunk management credentials. Daemon and connector operations emit versioned, redacted
-NDJSON lifecycle metrics with epoch timestamps to Splunk's `dbx-trace.log`.
+probes with verified Rustls TLS, prepares typed schemas, and streams bounded self-contained Arrow
+IPC batches through connector contract v1.2. The connector can bind a certified
+`TIMESTAMPTZ`-plus-`BIGINT` cursor through native PostgreSQL parameters and enforce deterministic
+outer ordering. A connector-neutral native registry validates cursor schema, nulls, strict tuple
+ordering, overlap bounds, and checkpoint candidates directly from Arrow before materializing
+explicit-null NDJSON for the current HEC delivery adapter. Unsupported or lossy PostgreSQL
+conversions fail closed. A singleton daemon is supervised as a continuous Splunk
+scripted input, loads typed layered configuration, keeps database credentials in an
+installation-specific authenticated encrypted store, and sends CPU-bounded non-overlapping input
+runs through a quota-bounded encrypted spool before verified local HEC delivery. Complete segments
+are authenticated, synchronized, and atomically sealed before network output; incomplete segments
+are quarantined on startup and ready segments are replayed in stable order. Each frozen HEC
+envelope includes a deterministic event identity for downstream replay deduplication. It can
+generate and reconcile a stable local HEC token and certificate without Splunk management
+credentials. Daemon and connector operations emit versioned, redacted NDJSON lifecycle metrics
+with epoch timestamps to Splunk's `dbx-trace.log`.
 
-Durable spool recovery and database checkpoint protocols are not implemented yet. HEC ACK confirms
-individual accepted batches, but the current end-to-end path must not be described as production
-at-least-once collection until those state machines exist. Detailed planning and operational
-material is maintained privately until it has been reviewed for public release.
+The `dbx-rs` administrative CLI now exposes typed JSON operations for validating one named input,
+probing its configured PostgreSQL connection, and running a tightly bounded read-only query test.
+Inline test SQL is read only from standard input, while file tests are restricted to the app's
+connector-specific query directory. These operations share serializable service DTOs intended for
+a future authenticated REST layer; no REST listener is currently exposed. The connector contract is
+currently an in-process boundary. The framed worker transport remains a later implementation step.
+
+A serializable checkpoint coordinator models independent collection and delivery completion,
+stale-generation fencing, replay recovery, and delivery-gated cursor commit. A checksummed,
+versioned filesystem repository now adds atomic compare-and-swap updates, one previous-state
+backup, corruption detection, and persisted scan-resume metadata. The repository is not yet used by
+scheduled inputs: current stanzas remain batch-only, and rising input configuration is deliberately
+unavailable until the cursor coordinator is wired end to end. Current batch delivery is durable
+at-least-once to the configured HEC boundary; replay duplicates remain possible after an uncertain
+HTTP or acknowledgment result. Detailed planning material is maintained privately until reviewed
+for public release.
 
 The first product objective is a PostgreSQL input under the Splunk-supervised daemon with durable,
 at-least-once collection and a composite rising cursor. Reliability and explicit delivery semantics
