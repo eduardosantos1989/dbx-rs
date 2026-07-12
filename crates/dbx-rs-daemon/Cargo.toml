@@ -9,11 +9,13 @@ publish = false
 
 [dependencies]
 configparser.workspace = true
+dbx-rs-checkpoint.workspace = true
 dbx-rs-config.workspace = true
 dbx-rs-connector-sdk.workspace = true
 dbx-rs-native-connectors.workspace = true
 dbx-rs-secure-store.workspace = true
 dbx-rs-spool.workspace = true
+dbx-rs-state.workspace = true
 dbx-rs-telemetry.workspace = true
 http.workspace = true
 rcgen.workspace = true

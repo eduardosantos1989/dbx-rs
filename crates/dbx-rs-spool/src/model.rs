@@ -5,6 +5,58 @@ use serde::{Deserialize, Serialize};
 use crate::{BatchId, Fingerprint, InputKey, SpoolError};
 
 pub const MIN_SEGMENT_BYTES: u64 = 512;
+pub const MAX_RECOVERY_METADATA_BYTES: usize = 128;
+
+/// Bounded opaque metadata used to reconcile a sealed segment after a crash.
+///
+/// The spool authenticates and preserves these bytes without interpreting them. Callers own the
+/// versioned metadata encoding and must not include secrets or row payloads.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct RecoveryMetadata(Vec<u8>);
+
+impl RecoveryMetadata {
+    /// Copies one bounded metadata value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value exceeds [`MAX_RECOVERY_METADATA_BYTES`].
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, SpoolError> {
+        let bytes = bytes.as_ref();
+        if bytes.len() > MAX_RECOVERY_METADATA_BYTES {
+            return Err(SpoolError::new(
+                "DBX-RS-SPOOL-LIMIT-0015",
+                "recovery_metadata",
+                "spool recovery metadata exceeds the hard limit",
+            ));
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for RecoveryMetadata {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryMetadata")
+            .field("bytes", &"[REDACTED]")
+            .field("length", &self.0.len())
+            .finish()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpoolLimits {

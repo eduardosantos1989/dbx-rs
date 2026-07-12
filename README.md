@@ -33,14 +33,20 @@ a future authenticated REST layer; no REST listener is currently exposed. The co
 currently an in-process boundary. The framed worker transport remains a later implementation step.
 
 A serializable checkpoint coordinator models independent collection and delivery completion,
-stale-generation fencing, replay recovery, and delivery-gated cursor commit. A checksummed,
-versioned filesystem repository now adds atomic compare-and-swap updates, one previous-state
-backup, corruption detection, and persisted scan-resume metadata. The repository is not yet used by
-scheduled inputs: current stanzas remain batch-only, and rising input configuration is deliberately
-unavailable until the cursor coordinator is wired end to end. Current batch delivery is durable
-at-least-once to the configured HEC boundary; replay duplicates remain possible after an uncertain
-HTTP or acknowledgment result. Detailed planning material is maintained privately until reviewed
-for public release.
+stale-generation fencing, replay recovery, and delivery-gated cursor commit. The scheduled daemon
+supports both batch stanzas and PostgreSQL rising stanzas with an immutable input UUID and a typed
+`TIMESTAMPTZ`-plus-`BIGINT` cursor. Every active rising attempt has a durable scan, and each
+non-empty page is authenticated and sealed in the spool before its reference is appended to the
+scan. Startup reconciliation can adopt a sealed page, resume collection, persist one sequential
+delivery receipt at a time, compact receipted segments, and finish an empty final page without
+inventing a cursor.
+
+A rising checkpoint advances only after collection is complete, every sealed page has crossed the
+configured HEC boundary, the complete delivery-receipt prefix is durable, and the coordinator has
+confirmed delivery. Delivery remains at-least-once: batch or rising envelopes can be replayed after
+an uncertain HTTP or indexer-acknowledgment result. Stable event identities support downstream
+deduplication without changing that delivery contract. Detailed planning material is maintained
+privately until reviewed for public release.
 
 The first product objective is a PostgreSQL input under the Splunk-supervised daemon with durable,
 at-least-once collection and a composite rising cursor. Reliability and explicit delivery semantics

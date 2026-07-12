@@ -8,10 +8,11 @@ use ring::hkdf;
 use crate::error::SpoolError;
 use crate::identity::{BatchId, Fingerprint, InputKey, SegmentId};
 use crate::key::{KEY_BYTES, KEY_ID_BYTES, SpoolKey};
-use crate::model::{SegmentHeader, SegmentSummary};
+use crate::model::{MAX_RECOVERY_METADATA_BYTES, RecoveryMetadata, SegmentHeader, SegmentSummary};
 
 pub(crate) const MAGIC: &[u8; 8] = b"DBXRSSPL";
-pub(crate) const FORMAT_VERSION: u16 = 1;
+pub(crate) const LEGACY_FORMAT_VERSION: u16 = 1;
+pub(crate) const FORMAT_VERSION: u16 = 2;
 const SALT_BYTES: usize = 32;
 pub(crate) const PREFIX_BYTES: usize = MAGIC.len() + 2 + KEY_ID_BYTES + SALT_BYTES + 16;
 const FRAME_PREFIX_BYTES: u64 = 4 + 8;
@@ -20,6 +21,7 @@ const FOOTER_PAYLOAD_BYTES: usize = 8 + 8 + 32;
 const FRAME_HEADER: u8 = 1;
 const FRAME_EVENT: u8 = 2;
 const FRAME_FOOTER: u8 = 3;
+const FRAME_RECOVERY_METADATA: u8 = 4;
 
 pub(crate) struct SegmentEncoder {
     file: File,
@@ -31,18 +33,39 @@ pub(crate) struct SegmentEncoder {
     event_count: u64,
     plaintext_bytes: u64,
     digest: Context,
+    format_version: u16,
 }
 
 impl SegmentEncoder {
     pub(crate) fn start(
-        mut file: File,
+        file: File,
         spool_key: &SpoolKey,
         salt: [u8; SALT_BYTES],
         segment_id: SegmentId,
         header: SegmentHeader,
         limit: u64,
     ) -> Result<Self, SpoolError> {
-        let prefix = encode_prefix(spool_key.id, salt, segment_id);
+        Self::start_with_version(
+            file,
+            spool_key,
+            salt,
+            segment_id,
+            header,
+            limit,
+            FORMAT_VERSION,
+        )
+    }
+
+    fn start_with_version(
+        mut file: File,
+        spool_key: &SpoolKey,
+        salt: [u8; SALT_BYTES],
+        segment_id: SegmentId,
+        header: SegmentHeader,
+        limit: u64,
+        format_version: u16,
+    ) -> Result<Self, SpoolError> {
+        let prefix = encode_prefix(spool_key.id, salt, segment_id, format_version);
         let key = derive_segment_key(&spool_key.bytes, &salt, segment_id)?;
         file.write_all(&prefix).map_err(|error| {
             SpoolError::io(
@@ -62,12 +85,13 @@ impl SegmentEncoder {
             event_count: 0,
             plaintext_bytes: 0,
             digest: Context::new(&SHA256),
+            format_version,
         };
         let header_payload = encode_header(header);
         encoder.write_typed_frame(FRAME_HEADER, &header_payload, false)?;
         if encoder
             .position
-            .checked_add(minimum_footer_frame_bytes())
+            .checked_add(terminal_frame_bytes(format_version))
             .is_none_or(|required| required > limit)
         {
             return Err(SpoolError::new(
@@ -105,7 +129,7 @@ impl SegmentEncoder {
         let required = self
             .position
             .checked_add(frame_bytes)
-            .and_then(|position| position.checked_add(minimum_footer_frame_bytes()))
+            .and_then(|position| position.checked_add(terminal_frame_bytes(self.format_version)))
             .ok_or_else(|| {
                 SpoolError::new(
                     "DBX-RS-SPOOL-LIMIT-0003",
@@ -153,7 +177,17 @@ impl SegmentEncoder {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self) -> Result<(File, SegmentSummary, u64), SpoolError> {
+    pub(crate) fn finish(
+        self,
+        recovery_metadata: &RecoveryMetadata,
+    ) -> Result<(File, SegmentSummary, u64), SpoolError> {
+        self.finish_inner(Some(recovery_metadata))
+    }
+
+    fn finish_inner(
+        mut self,
+        recovery_metadata: Option<&RecoveryMetadata>,
+    ) -> Result<(File, SegmentSummary, u64), SpoolError> {
         let digest = self.digest.clone().finish();
         let mut stream_digest = [0_u8; 32];
         stream_digest.copy_from_slice(digest.as_ref());
@@ -162,6 +196,17 @@ impl SegmentEncoder {
             plaintext_bytes: self.plaintext_bytes,
             stream_digest,
         };
+        match (self.format_version, recovery_metadata) {
+            (FORMAT_VERSION, Some(recovery_metadata)) => {
+                self.write_typed_frame(
+                    FRAME_RECOVERY_METADATA,
+                    recovery_metadata.as_bytes(),
+                    false,
+                )?;
+            }
+            (LEGACY_FORMAT_VERSION, None) => {}
+            _ => return Err(invalid_version()),
+        }
         let footer = encode_footer(summary);
         self.write_typed_frame(FRAME_FOOTER, &footer, false)?;
         self.file.sync_all().map_err(|error| {
@@ -173,6 +218,11 @@ impl SegmentEncoder {
             )
         })?;
         Ok((self.file, summary, self.position))
+    }
+
+    #[cfg(test)]
+    fn finish_legacy(self) -> Result<(File, SegmentSummary, u64), SpoolError> {
+        self.finish_inner(None)
     }
 
     fn write_typed_frame(
@@ -263,6 +313,8 @@ pub(crate) struct SegmentDecoder {
     limit: u64,
     remaining_bytes: u64,
     pub(crate) header: SegmentHeader,
+    format_version: u16,
+    recovery_metadata: Option<RecoveryMetadata>,
 }
 
 impl SegmentDecoder {
@@ -289,7 +341,7 @@ impl SegmentDecoder {
         let mut reader = BufReader::new(file);
         let mut prefix = [0_u8; PREFIX_BYTES];
         read_exact(&mut reader, &mut prefix, "prefix_read")?;
-        let (key_id, salt, segment_id) = decode_prefix(&prefix)?;
+        let (format_version, key_id, salt, segment_id) = decode_prefix(&prefix)?;
         if key_id != spool_key.id {
             return Err(SpoolError::new(
                 "DBX-RS-SPOOL-CRYPTO-0002",
@@ -320,6 +372,8 @@ impl SegmentDecoder {
                 segment_sequence: 0,
                 created_epoch_millis: 0,
             },
+            format_version,
+            recovery_metadata: None,
         };
         let header_frame = decoder.read_frame()?;
         if header_frame.first().copied() != Some(FRAME_HEADER) {
@@ -333,93 +387,130 @@ impl SegmentDecoder {
         self.segment_id
     }
 
+    pub(crate) const fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
     pub(crate) const fn summary(&self) -> Option<SegmentSummary> {
         self.summary
+    }
+
+    pub(crate) fn recovery_metadata(&self) -> Option<&RecoveryMetadata> {
+        self.recovery_metadata.as_ref()
     }
 
     pub(crate) fn next_event(&mut self) -> Result<Option<Vec<u8>>, SpoolError> {
         if self.done {
             return Ok(None);
         }
-        let frame = self.read_frame()?;
-        let (&frame_type, payload) = frame.split_first().ok_or_else(invalid_frame_type)?;
-        match frame_type {
-            FRAME_EVENT => {
-                if payload.is_empty() {
+        loop {
+            let frame = self.read_frame()?;
+            let (&frame_type, payload) = frame.split_first().ok_or_else(invalid_frame_type)?;
+            match frame_type {
+                FRAME_EVENT => return self.accept_event(payload).map(Some),
+                FRAME_RECOVERY_METADATA => {
+                    if self.format_version != FORMAT_VERSION {
+                        return Err(invalid_frame_type());
+                    }
+                    if self.recovery_metadata.is_some() {
+                        return Err(repeated_metadata_error());
+                    }
+                    self.recovery_metadata = Some(RecoveryMetadata::new(payload)?);
+                }
+                FRAME_FOOTER => {
+                    self.accept_footer(payload)?;
+                    return Ok(None);
+                }
+                FRAME_HEADER => {
                     return Err(SpoolError::new(
-                        "DBX-RS-SPOOL-FORMAT-0008",
-                        "event_read",
-                        "spool event frame is empty",
+                        "DBX-RS-SPOOL-FORMAT-0012",
+                        "frame_order",
+                        "spool segment contains a repeated header",
                     ));
                 }
-                let event_bytes = u64::try_from(payload.len()).map_err(|_| {
-                    SpoolError::new(
-                        "DBX-RS-SPOOL-LIMIT-0010",
-                        "event_read",
-                        "spool plaintext byte count overflowed",
-                    )
-                })?;
-                self.event_count = self.event_count.checked_add(1).ok_or_else(|| {
-                    SpoolError::new(
-                        "DBX-RS-SPOOL-LIMIT-0011",
-                        "event_read",
-                        "spool event count overflowed",
-                    )
-                })?;
-                self.plaintext_bytes =
-                    self.plaintext_bytes
-                        .checked_add(event_bytes)
-                        .ok_or_else(|| {
-                            SpoolError::new(
-                                "DBX-RS-SPOOL-LIMIT-0010",
-                                "event_read",
-                                "spool plaintext byte count overflowed",
-                            )
-                        })?;
-                self.digest.update(&event_bytes.to_be_bytes());
-                self.digest.update(payload);
-                Ok(Some(payload.to_vec()))
+                _ => return Err(invalid_frame_type()),
             }
-            FRAME_FOOTER => {
-                let summary = decode_footer(payload)?;
-                let digest = self.digest.clone().finish();
-                if summary.event_count != self.event_count
-                    || summary.plaintext_bytes != self.plaintext_bytes
-                    || summary.stream_digest.as_slice() != digest.as_ref()
-                {
-                    return Err(SpoolError::new(
-                        "DBX-RS-SPOOL-FORMAT-0009",
-                        "footer_validate",
-                        "spool footer accounting or digest is invalid",
-                    ));
-                }
-                let mut trailing = [0_u8; 1];
-                let trailing_bytes = self.reader.read(&mut trailing).map_err(|error| {
-                    SpoolError::io(
-                        "DBX-RS-SPOOL-FORMAT-0010",
-                        "trailing_validate",
-                        "failed to inspect the spool segment terminator",
-                        &error,
-                    )
-                })?;
-                if trailing_bytes != 0 {
-                    return Err(SpoolError::new(
-                        "DBX-RS-SPOOL-FORMAT-0011",
-                        "trailing_validate",
-                        "spool segment has trailing data",
-                    ));
-                }
-                self.summary = Some(summary);
-                self.done = true;
-                Ok(None)
-            }
-            FRAME_HEADER => Err(SpoolError::new(
-                "DBX-RS-SPOOL-FORMAT-0012",
-                "frame_order",
-                "spool segment contains a repeated header",
-            )),
-            _ => Err(invalid_frame_type()),
         }
+    }
+
+    fn accept_event(&mut self, payload: &[u8]) -> Result<Vec<u8>, SpoolError> {
+        if self.format_version == FORMAT_VERSION && self.recovery_metadata.is_some() {
+            return Err(metadata_order_error());
+        }
+        if payload.is_empty() {
+            return Err(SpoolError::new(
+                "DBX-RS-SPOOL-FORMAT-0008",
+                "event_read",
+                "spool event frame is empty",
+            ));
+        }
+        let event_bytes = u64::try_from(payload.len()).map_err(|_| {
+            SpoolError::new(
+                "DBX-RS-SPOOL-LIMIT-0010",
+                "event_read",
+                "spool plaintext byte count overflowed",
+            )
+        })?;
+        self.event_count = self.event_count.checked_add(1).ok_or_else(|| {
+            SpoolError::new(
+                "DBX-RS-SPOOL-LIMIT-0011",
+                "event_read",
+                "spool event count overflowed",
+            )
+        })?;
+        self.plaintext_bytes = self
+            .plaintext_bytes
+            .checked_add(event_bytes)
+            .ok_or_else(|| {
+                SpoolError::new(
+                    "DBX-RS-SPOOL-LIMIT-0010",
+                    "event_read",
+                    "spool plaintext byte count overflowed",
+                )
+            })?;
+        self.digest.update(&event_bytes.to_be_bytes());
+        self.digest.update(payload);
+        Ok(payload.to_vec())
+    }
+
+    fn accept_footer(&mut self, payload: &[u8]) -> Result<(), SpoolError> {
+        if self.format_version == FORMAT_VERSION && self.recovery_metadata.is_none() {
+            return Err(missing_metadata_error());
+        }
+        let summary = decode_footer(payload)?;
+        let digest = self.digest.clone().finish();
+        if summary.event_count != self.event_count
+            || summary.plaintext_bytes != self.plaintext_bytes
+            || summary.stream_digest.as_slice() != digest.as_ref()
+        {
+            return Err(SpoolError::new(
+                "DBX-RS-SPOOL-FORMAT-0009",
+                "footer_validate",
+                "spool footer accounting or digest is invalid",
+            ));
+        }
+        let mut trailing = [0_u8; 1];
+        let trailing_bytes = self.reader.read(&mut trailing).map_err(|error| {
+            SpoolError::io(
+                "DBX-RS-SPOOL-FORMAT-0010",
+                "trailing_validate",
+                "failed to inspect the spool segment terminator",
+                &error,
+            )
+        })?;
+        if trailing_bytes != 0 {
+            return Err(SpoolError::new(
+                "DBX-RS-SPOOL-FORMAT-0011",
+                "trailing_validate",
+                "spool segment has trailing data",
+            ));
+        }
+        if self.format_version == LEGACY_FORMAT_VERSION {
+            self.recovery_metadata = Some(RecoveryMetadata::empty());
+        }
+        self.summary = Some(summary);
+        self.done = true;
+        Ok(())
     }
 
     fn read_frame(&mut self) -> Result<Vec<u8>, SpoolError> {
@@ -452,7 +543,9 @@ impl SegmentDecoder {
         if u64::from(cipher_length) > remaining_ciphertext {
             return Err(truncated_segment());
         }
-        if u64::from(cipher_length) > maximum_ciphertext_frame_bytes(self.limit) {
+        if u64::from(cipher_length)
+            > maximum_ciphertext_frame_bytes(self.limit, self.format_version)
+        {
             return Err(SpoolError::new(
                 "DBX-RS-SPOOL-FORMAT-0013",
                 "frame_read",
@@ -497,11 +590,12 @@ fn encode_prefix(
     key_id: [u8; KEY_ID_BYTES],
     salt: [u8; SALT_BYTES],
     segment_id: SegmentId,
+    format_version: u16,
 ) -> [u8; PREFIX_BYTES] {
     let mut prefix = [0_u8; PREFIX_BYTES];
     let mut offset = 0;
     put(&mut prefix, &mut offset, MAGIC);
-    put(&mut prefix, &mut offset, &FORMAT_VERSION.to_be_bytes());
+    put(&mut prefix, &mut offset, &format_version.to_be_bytes());
     put(&mut prefix, &mut offset, &key_id);
     put(&mut prefix, &mut offset, &salt);
     put(&mut prefix, &mut offset, segment_id.as_bytes());
@@ -510,7 +604,7 @@ fn encode_prefix(
 
 fn decode_prefix(
     prefix: &[u8; PREFIX_BYTES],
-) -> Result<([u8; KEY_ID_BYTES], [u8; SALT_BYTES], SegmentId), SpoolError> {
+) -> Result<(u16, [u8; KEY_ID_BYTES], [u8; SALT_BYTES], SegmentId), SpoolError> {
     if &prefix[..MAGIC.len()] != MAGIC {
         return Err(SpoolError::new(
             "DBX-RS-SPOOL-FORMAT-0015",
@@ -520,18 +614,14 @@ fn decode_prefix(
     }
     let version_offset = MAGIC.len();
     let version = u16::from_be_bytes([prefix[version_offset], prefix[version_offset + 1]]);
-    if version != FORMAT_VERSION {
-        return Err(SpoolError::new(
-            "DBX-RS-SPOOL-FORMAT-0016",
-            "version_validate",
-            "spool segment format version is unsupported",
-        ));
+    if !matches!(version, LEGACY_FORMAT_VERSION | FORMAT_VERSION) {
+        return Err(invalid_version());
     }
     let mut offset = MAGIC.len() + 2;
     let key_id = take::<KEY_ID_BYTES>(prefix, &mut offset);
     let salt = take::<SALT_BYTES>(prefix, &mut offset);
     let segment_id = SegmentId::new(take::<16>(prefix, &mut offset));
-    Ok((key_id, salt, segment_id))
+    Ok((version, key_id, salt, segment_id))
 }
 
 fn encode_header(header: SegmentHeader) -> [u8; HEADER_PAYLOAD_BYTES] {
@@ -648,16 +738,40 @@ fn encoded_frame_bytes(plaintext_length: usize) -> Result<u64, SpoolError> {
         })
 }
 
-fn minimum_footer_frame_bytes() -> u64 {
+fn footer_frame_bytes() -> u64 {
     encoded_frame_bytes(FOOTER_PAYLOAD_BYTES + 1).unwrap_or(u64::MAX)
 }
 
-pub(crate) fn maximum_ciphertext_frame_bytes(limit: u64) -> u64 {
+fn maximum_recovery_metadata_frame_bytes() -> u64 {
+    encoded_frame_bytes(MAX_RECOVERY_METADATA_BYTES + 1).unwrap_or(u64::MAX)
+}
+
+fn terminal_frame_bytes(format_version: u16) -> u64 {
+    match format_version {
+        LEGACY_FORMAT_VERSION => footer_frame_bytes(),
+        FORMAT_VERSION => {
+            maximum_recovery_metadata_frame_bytes().saturating_add(footer_frame_bytes())
+        }
+        _ => u64::MAX,
+    }
+}
+
+pub(crate) fn maximum_ciphertext_frame_bytes(limit: u64, format_version: u16) -> u64 {
+    let header_frame_bytes = encoded_frame_bytes(HEADER_PAYLOAD_BYTES + 1).unwrap_or(u64::MAX);
     let fixed_format_bytes = (PREFIX_BYTES as u64)
-        .checked_add(encoded_frame_bytes(HEADER_PAYLOAD_BYTES + 1).unwrap_or(u64::MAX))
-        .and_then(|bytes| bytes.checked_add(minimum_footer_frame_bytes()))
+        .checked_add(header_frame_bytes)
+        .and_then(|bytes| bytes.checked_add(terminal_frame_bytes(format_version)))
         .and_then(|bytes| bytes.checked_add(FRAME_PREFIX_BYTES));
-    fixed_format_bytes.map_or(0, |bytes| limit.saturating_sub(bytes))
+    let maximum_event_ciphertext =
+        fixed_format_bytes.map_or(0, |bytes| limit.saturating_sub(bytes));
+    match format_version {
+        LEGACY_FORMAT_VERSION => maximum_event_ciphertext,
+        FORMAT_VERSION => maximum_event_ciphertext
+            .max((HEADER_PAYLOAD_BYTES + 1 + aead::CHACHA20_POLY1305.tag_len()) as u64)
+            .max((MAX_RECOVERY_METADATA_BYTES + 1 + aead::CHACHA20_POLY1305.tag_len()) as u64)
+            .max((FOOTER_PAYLOAD_BYTES + 1 + aead::CHACHA20_POLY1305.tag_len()) as u64),
+        _ => 0,
+    }
 }
 
 fn derive_segment_key(
@@ -768,4 +882,226 @@ const fn invalid_frame_type() -> SpoolError {
         "frame_type",
         "spool frame type is invalid",
     )
+}
+
+const fn invalid_version() -> SpoolError {
+    SpoolError::new(
+        "DBX-RS-SPOOL-FORMAT-0016",
+        "version_validate",
+        "spool segment format version is unsupported",
+    )
+}
+
+const fn missing_metadata_error() -> SpoolError {
+    SpoolError::new(
+        "DBX-RS-SPOOL-FORMAT-0025",
+        "recovery_metadata",
+        "version 2 spool segment has no recovery metadata frame",
+    )
+}
+
+const fn repeated_metadata_error() -> SpoolError {
+    SpoolError::new(
+        "DBX-RS-SPOOL-FORMAT-0026",
+        "recovery_metadata",
+        "spool segment contains repeated recovery metadata",
+    )
+}
+
+const fn metadata_order_error() -> SpoolError {
+    SpoolError::new(
+        "DBX-RS-SPOOL-FORMAT-0027",
+        "frame_order",
+        "spool recovery metadata is not the final frame before the footer",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture {
+        root: PathBuf,
+        segment_path: PathBuf,
+        key: SpoolKey,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dbx-rs-format-{label}-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).expect("test directory must be created");
+            let key = SpoolKey::load_or_create(&root.join("keys/spool.key"))
+                .expect("test key must be created");
+            Self {
+                segment_path: root.join("segment.dbx"),
+                root,
+                key,
+            }
+        }
+
+        fn encoder(&self, format_version: u16) -> SegmentEncoder {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&self.segment_path)
+                .expect("segment file must be created");
+            SegmentEncoder::start_with_version(
+                file,
+                &self.key,
+                [0x21; SALT_BYTES],
+                SegmentId::new([0x31; 16]),
+                header(),
+                4_096,
+                format_version,
+            )
+            .expect("encoder must start")
+        }
+
+        fn decoder(&self) -> Result<SegmentDecoder, SpoolError> {
+            let file = File::open(&self.segment_path).expect("segment must open");
+            SegmentDecoder::open(file, &self.key, 4_096)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ignored = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn header() -> SegmentHeader {
+        SegmentHeader {
+            input_key: InputKey::new([0x41; 32]),
+            configuration_fingerprint: Fingerprint::new([0x42; 32]),
+            configuration_generation: 3,
+            batch_id: BatchId::new([0x43; 16]),
+            batch_sequence: 5,
+            segment_sequence: 7,
+            created_epoch_millis: 11,
+        }
+    }
+
+    fn summary(encoder: &SegmentEncoder) -> SegmentSummary {
+        let digest = encoder.digest.clone().finish();
+        let mut stream_digest = [0_u8; 32];
+        stream_digest.copy_from_slice(digest.as_ref());
+        SegmentSummary {
+            event_count: encoder.event_count,
+            plaintext_bytes: encoder.plaintext_bytes,
+            stream_digest,
+        }
+    }
+
+    fn write_footer(mut encoder: SegmentEncoder) {
+        let footer = encode_footer(summary(&encoder));
+        encoder
+            .write_typed_frame(FRAME_FOOTER, &footer, false)
+            .expect("footer must write");
+        encoder.file.sync_all().expect("segment must synchronize");
+    }
+
+    fn decode_to_end(fixture: &Fixture) -> Result<SegmentDecoder, SpoolError> {
+        let mut decoder = fixture.decoder()?;
+        while decoder.next_event()?.is_some() {}
+        Ok(decoder)
+    }
+
+    fn decode_error(fixture: &Fixture, message: &str) -> SpoolError {
+        match decode_to_end(fixture) {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn version_one_segment_remains_readable_with_empty_recovery_metadata() {
+        let fixture = Fixture::new("v1");
+        let mut encoder = fixture.encoder(LEGACY_FORMAT_VERSION);
+        encoder.append_event(b"legacy").expect("event must append");
+        let _sealed = encoder.finish_legacy().expect("legacy segment must finish");
+
+        let mut decoder = fixture.decoder().expect("legacy decoder must open");
+        assert_eq!(decoder.format_version(), LEGACY_FORMAT_VERSION);
+        assert_eq!(
+            decoder.next_event().expect("event must decode"),
+            Some(b"legacy".to_vec())
+        );
+        assert_eq!(decoder.next_event().expect("footer must decode"), None);
+        assert_eq!(
+            decoder
+                .recovery_metadata()
+                .expect("legacy metadata view must exist")
+                .as_bytes(),
+            b""
+        );
+    }
+
+    #[test]
+    fn version_two_rejects_missing_repeated_and_out_of_order_metadata() {
+        let missing = Fixture::new("missing-metadata");
+        let mut encoder = missing.encoder(FORMAT_VERSION);
+        encoder.append_event(b"event").expect("event must append");
+        write_footer(encoder);
+        assert_eq!(
+            decode_error(&missing, "missing metadata must fail").code(),
+            "DBX-RS-SPOOL-FORMAT-0025"
+        );
+
+        let repeated = Fixture::new("repeated-metadata");
+        let mut encoder = repeated.encoder(FORMAT_VERSION);
+        encoder.append_event(b"event").expect("event must append");
+        encoder
+            .write_typed_frame(FRAME_RECOVERY_METADATA, b"first", false)
+            .expect("metadata must write");
+        encoder
+            .write_typed_frame(FRAME_RECOVERY_METADATA, b"second", false)
+            .expect("metadata must write");
+        write_footer(encoder);
+        assert_eq!(
+            decode_error(&repeated, "repeated metadata must fail").code(),
+            "DBX-RS-SPOOL-FORMAT-0026"
+        );
+
+        let out_of_order = Fixture::new("out-of-order-metadata");
+        let mut encoder = out_of_order.encoder(FORMAT_VERSION);
+        encoder
+            .write_typed_frame(FRAME_RECOVERY_METADATA, b"metadata", false)
+            .expect("metadata must write");
+        encoder.append_event(b"event").expect("event must append");
+        write_footer(encoder);
+        assert_eq!(
+            decode_error(&out_of_order, "event after metadata must fail").code(),
+            "DBX-RS-SPOOL-FORMAT-0027"
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_authenticated_oversize_recovery_metadata() {
+        let fixture = Fixture::new("oversize-metadata");
+        let mut encoder = fixture.encoder(FORMAT_VERSION);
+        encoder
+            .write_typed_frame(
+                FRAME_RECOVERY_METADATA,
+                &[0x51; MAX_RECOVERY_METADATA_BYTES + 1],
+                false,
+            )
+            .expect("raw oversize metadata must write for the decoder test");
+        write_footer(encoder);
+
+        assert_eq!(
+            decode_error(&fixture, "oversize metadata must fail").code(),
+            "DBX-RS-SPOOL-LIMIT-0015"
+        );
+    }
 }

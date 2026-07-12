@@ -17,5 +17,8 @@ mod spool;
 pub use error::SpoolError;
 pub use identity::{BatchId, Fingerprint, InputKey, SegmentId};
 pub use key::SpoolKey;
-pub use model::{MIN_SEGMENT_BYTES, SegmentHeader, SegmentSummary, SpoolLimits, SpoolUsage};
+pub use model::{
+    MAX_RECOVERY_METADATA_BYTES, MIN_SEGMENT_BYTES, RecoveryMetadata, SegmentHeader,
+    SegmentSummary, SpoolLimits, SpoolUsage,
+};
 pub use spool::{DeliveredSegment, ReadySegment, SegmentReader, SegmentWriter, Spool};

@@ -6,6 +6,8 @@ mod identity;
 mod lifecycle;
 mod operational;
 mod prepared;
+mod rising;
+mod rising_metadata;
 mod runtime;
 mod splunk;
 mod worker;
@@ -100,7 +102,7 @@ async fn execute(command: Command) -> Result<(), DaemonError> {
                     runtime::run(&locations.app_home, &locations.splunk_home, config).await
                 }
                 Action::Bootstrap => {
-                    let result = runtime::bootstrap(&config)?;
+                    let result = runtime::bootstrap(&config, &locations.splunk_home)?;
                     println!("splunk_inputs_changed={}", result.splunk_inputs_changed);
                     println!("certificate_created={}", result.certificate_created);
                     println!(

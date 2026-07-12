@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 
 use super::*;
-use crate::{BatchId, Fingerprint};
+use crate::{BatchId, Fingerprint, MAX_RECOVERY_METADATA_BYTES, RecoveryMetadata, SegmentId};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -103,6 +103,23 @@ fn overwrite(path: &Path, offset: u64, replacement: &[u8]) {
     file.sync_all().expect("corruption must synchronize");
 }
 
+fn encrypted_frame_payload_offsets(path: &Path) -> Vec<u64> {
+    let bytes = fs::read(path).expect("segment must be readable");
+    let mut offset = crate::format::PREFIX_BYTES;
+    let mut payloads = Vec::new();
+    while offset < bytes.len() {
+        let length = u32::from_be_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("frame length must exist"),
+        ) as usize;
+        payloads.push(u64::try_from(offset + 12).expect("frame offset must fit"));
+        offset += 12 + length;
+    }
+    assert_eq!(offset, bytes.len());
+    payloads
+}
+
 #[test]
 fn encrypted_segment_round_trips_multiple_exact_events() {
     let fixture = Fixture::new();
@@ -128,6 +145,124 @@ fn empty_segment_has_an_authenticated_footer() {
     assert_eq!(ready.summary().event_count, 0);
     assert_eq!(ready.summary().plaintext_bytes, 0);
     assert!(read_events(&spool, &ready).is_empty());
+    assert!(ready.recovery_metadata().as_bytes().is_empty());
+}
+
+#[test]
+fn recovery_metadata_round_trips_through_ready_and_delivered_inventory() {
+    let fixture = Fixture::new();
+    let spool = fixture.open(limits());
+    let metadata = RecoveryMetadata::new(b"cursor-recovery-v1").expect("metadata must fit");
+    let mut writer = spool
+        .begin_segment(header(input(1), 1, 1))
+        .expect("segment must begin");
+    writer.append_event(b"event").expect("event must append");
+    let ready = writer
+        .seal_with_recovery_metadata(metadata.clone())
+        .expect("segment must seal");
+
+    assert_eq!(ready.recovery_metadata(), &metadata);
+    let reopened = spool.list_ready().expect("ready inventory must pass");
+    assert_eq!(reopened[0].recovery_metadata(), &metadata);
+    assert_eq!(reopened[0].reference_digest(), ready.reference_digest());
+    let delivered = spool
+        .mark_delivered(&reopened[0])
+        .expect("segment must become delivered");
+    assert_eq!(delivered.recovery_metadata(), &metadata);
+    assert_eq!(delivered.reference_digest(), ready.reference_digest());
+}
+
+#[test]
+fn recovery_metadata_is_hard_bounded() {
+    assert!(RecoveryMetadata::new([0x41; MAX_RECOVERY_METADATA_BYTES]).is_ok());
+    let error = RecoveryMetadata::new(vec![0x41; MAX_RECOVERY_METADATA_BYTES + 1])
+        .expect_err("oversize metadata must fail");
+
+    assert_eq!(error.code(), "DBX-RS-SPOOL-LIMIT-0015");
+}
+
+#[test]
+fn version_two_reserves_maximum_terminal_metadata_before_event_append() {
+    let fixture = Fixture::new();
+    let limits = SpoolLimits::new(512, 1_024, 2_048).expect("limits must work");
+    let spool = fixture.open(limits);
+    let mut exact = spool
+        .begin_segment(header(input(1), 1, 1))
+        .expect("segment must begin");
+    exact
+        .append_event(&[0x41; 34])
+        .expect("exactly bounded event must fit");
+    let ready = exact
+        .seal_with_recovery_metadata(
+            RecoveryMetadata::new([0x52; MAX_RECOVERY_METADATA_BYTES]).expect("metadata must fit"),
+        )
+        .expect("reserved terminal frames must fit");
+    assert_eq!(ready.byte_len(), 512);
+
+    let mut overflow = spool
+        .begin_segment(header(input(1), 2, 1))
+        .expect("second segment must begin");
+    let error = overflow
+        .append_event(&[0x41; 35])
+        .expect_err("one extra event byte must exceed the segment");
+    assert_eq!(error.code(), "DBX-RS-SPOOL-LIMIT-0004");
+    overflow.abort().expect("failed writer must abort");
+}
+
+#[test]
+fn recovery_metadata_tampering_blocks_inventory() {
+    let fixture = Fixture::new();
+    let spool = fixture.open(limits());
+    let mut writer = spool
+        .begin_segment(header(input(1), 1, 1))
+        .expect("segment must begin");
+    writer.append_event(b"event").expect("event must append");
+    let ready = writer
+        .seal_with_recovery_metadata(
+            RecoveryMetadata::new(b"authenticated").expect("metadata must fit"),
+        )
+        .expect("segment must seal");
+    let offsets = encrypted_frame_payload_offsets(&ready.path);
+    let metadata_offset = offsets[offsets.len() - 2];
+    mutate(&ready.path, metadata_offset, 0xff);
+
+    assert!(spool.list_ready().is_err());
+}
+
+#[test]
+fn reference_digest_binds_every_recovery_identity_component() {
+    let fixture = Fixture::new();
+    let spool = fixture.open(limits());
+    let mut writer = spool
+        .begin_segment(header(input(1), 1, 1))
+        .expect("segment must begin");
+    writer.append_event(b"event").expect("event must append");
+    let ready = writer
+        .seal_with_recovery_metadata(RecoveryMetadata::new(b"metadata").expect("metadata must fit"))
+        .expect("segment must seal");
+    let digest = ready.reference_digest();
+
+    let mut changed_header = ready.clone();
+    changed_header.header.configuration_generation += 1;
+    assert_ne!(changed_header.reference_digest(), digest);
+    let mut changed_segment = ready.clone();
+    changed_segment.segment_id = SegmentId::new([0x77; 16]);
+    assert_ne!(changed_segment.reference_digest(), digest);
+    let mut changed_summary = ready.clone();
+    changed_summary.summary.stream_digest[0] ^= 1;
+    assert_ne!(changed_summary.reference_digest(), digest);
+    let mut changed_metadata = ready.clone();
+    changed_metadata.recovery_metadata =
+        RecoveryMetadata::new(b"different").expect("metadata must fit");
+    assert_ne!(changed_metadata.reference_digest(), digest);
+    let mut changed_version = ready.clone();
+    changed_version.format_version -= 1;
+    assert_ne!(changed_version.reference_digest(), digest);
+
+    let error = spool
+        .mark_delivered(&changed_metadata)
+        .expect_err("mismatched cached metadata must fail validation");
+    assert_eq!(error.code(), "DBX-RS-SPOOL-FORMAT-0024");
 }
 
 #[test]
@@ -225,7 +360,7 @@ fn truncation_trailing_data_and_unknown_version_are_rejected() {
                 file.write_all(b"x").expect("trailing byte must append");
                 file.sync_all().expect("trailing byte must synchronize");
             }
-            "version" => mutate(&ready.path, 9, 2),
+            "version" => mutate(&ready.path, 9, 3),
             _ => unreachable!(),
         }
 
@@ -271,10 +406,11 @@ fn declared_frame_length_cannot_consume_required_format_overhead() {
     let constrained = SpoolLimits::new(512, 1024, 2048).expect("limits are valid");
     let spool = fixture.open(constrained);
     let ready = seal(&spool, header(input(1), 1, 0), &[b"event"]);
-    let declared = crate::format::maximum_ciphertext_frame_bytes(512)
-        .checked_add(1)
-        .and_then(|value| u32::try_from(value).ok())
-        .expect("test frame length must fit");
+    let declared =
+        crate::format::maximum_ciphertext_frame_bytes(512, crate::format::FORMAT_VERSION)
+            .checked_add(1)
+            .and_then(|value| u32::try_from(value).ok())
+            .expect("test frame length must fit");
     let file = OpenOptions::new()
         .write(true)
         .open(&ready.path)

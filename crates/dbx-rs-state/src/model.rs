@@ -2,12 +2,14 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 
-use dbx_rs_checkpoint::{AttemptId, CollectionState, SNAPSHOT_FORMAT_VERSION, Snapshot};
+use dbx_rs_checkpoint::{
+    AttemptId, CollectionState, DeliveryState, SNAPSHOT_FORMAT_VERSION, Snapshot,
+};
 use dbx_rs_connector_sdk::TimestampIdCursor;
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 
-pub const DURABLE_STATE_FORMAT_VERSION: u16 = 1;
+pub const DURABLE_STATE_FORMAT_VERSION: u16 = 2;
 pub const MAX_SEGMENTS_PER_SCAN: usize = 4_096;
 
 const STATE_KEY_DOMAIN: &[u8] = b"dbx-rs-state-key-v1\0";
@@ -186,9 +188,12 @@ pub struct ActiveScan {
     pub base_committed: Option<TimestampIdCursor>,
     pub resume_after: Option<TimestampIdCursor>,
     pub maximum_candidate: Option<TimestampIdCursor>,
+    pub compacted_through_sequence: u64,
+    pub compacted_rows: u64,
     pub next_page: u64,
     pub complete: bool,
     pub segments: Vec<SegmentRef>,
+    pub delivered_through_sequence: u64,
 }
 
 impl fmt::Debug for ActiveScan {
@@ -208,9 +213,18 @@ impl fmt::Debug for ActiveScan {
                 "maximum_candidate",
                 &self.maximum_candidate.as_ref().map(|_| "[CONFIGURED]"),
             )
+            .field(
+                "compacted_through_sequence",
+                &self.compacted_through_sequence,
+            )
+            .field("compacted_rows", &self.compacted_rows)
             .field("next_page", &self.next_page)
             .field("complete", &self.complete)
             .field("segments", &self.segments)
+            .field(
+                "delivered_through_sequence",
+                &self.delivered_through_sequence,
+            )
             .finish()
     }
 }
@@ -233,7 +247,21 @@ impl ActiveScan {
         if self.segments.len() > MAX_SEGMENTS_PER_SCAN {
             return Err(StateValidationError::TooManySegments);
         }
-        if self.segments.is_empty() {
+        let segment_count = self.segment_count()?;
+        if self.compacted_through_sequence > self.delivered_through_sequence
+            || self.delivered_through_sequence > segment_count
+            || (self.compacted_through_sequence == 0 && self.compacted_rows != 0)
+            || (self.compacted_through_sequence != 0 && self.compacted_rows == 0)
+        {
+            return Err(StateValidationError::InvalidDeliveryReceipt);
+        }
+        if segment_count == 0 {
+            if self.next_page != 1
+                || self.compacted_through_sequence != 0
+                || self.compacted_rows != 0
+            {
+                return Err(StateValidationError::InvalidNextPage);
+            }
             if self.resume_after.is_some() || self.maximum_candidate.is_some() {
                 return Err(StateValidationError::UnexpectedScanCursor);
             }
@@ -252,15 +280,14 @@ impl ActiveScan {
         }
 
         let mut ids = HashSet::with_capacity(self.segments.len());
-        let mut expected_sequence = 1_u64;
-        let mut expected_page = 0_u64;
-        let mut sealed_rows = 0_u64;
+        let mut expected_sequence = self
+            .compacted_through_sequence
+            .checked_add(1)
+            .ok_or(StateValidationError::InvalidSegmentOrder)?;
+        let mut sealed_rows = self.compacted_rows;
         for segment in &self.segments {
-            if segment.sequence == 0
-                || segment.page == 0
-                || segment.page >= self.next_page
-                || segment.sequence != expected_sequence
-                || !(segment.page == expected_page || segment.page == expected_page + 1)
+            if segment.sequence != expected_sequence
+                || segment.page != expected_sequence
                 || segment.rows == 0
             {
                 return Err(StateValidationError::InvalidSegmentOrder);
@@ -274,9 +301,8 @@ impl ActiveScan {
             expected_sequence = expected_sequence
                 .checked_add(1)
                 .ok_or(StateValidationError::InvalidSegmentOrder)?;
-            expected_page = segment.page;
         }
-        if !self.segments.is_empty() && expected_page + 1 != self.next_page {
+        if expected_sequence != self.next_page {
             return Err(StateValidationError::InvalidSegmentOrder);
         }
         if sealed_rows > 0 && self.maximum_candidate.is_none() {
@@ -298,7 +324,22 @@ impl ActiveScan {
             }
             CollectionState::InProgress | CollectionState::Failed => {}
         }
+        if let DeliveryState::Confirmed { rows } = active.delivery
+            && (!self.complete
+                || self.delivered_through_sequence != segment_count
+                || rows != sealed_rows)
+        {
+            return Err(StateValidationError::DeliveryConfirmationMismatch);
+        }
         Ok(())
+    }
+
+    fn segment_count(&self) -> Result<u64, StateValidationError> {
+        let retained = u64::try_from(self.segments.len())
+            .map_err(|_| StateValidationError::InvalidDeliveryReceipt)?;
+        self.compacted_through_sequence
+            .checked_add(retained)
+            .ok_or(StateValidationError::InvalidSegmentOrder)
     }
 }
 
@@ -306,7 +347,7 @@ impl ActiveScan {
 pub struct DurableInputState {
     pub format_version: u16,
     pub input_id: InputId,
-    pub query_fingerprint: Fingerprint,
+    pub source_lineage_fingerprint: Fingerprint,
     pub cursor_identity_fingerprint: Fingerprint,
     pub configuration_fingerprint: Fingerprint,
     pub configuration_generation: u64,
@@ -318,7 +359,7 @@ impl DurableInputState {
     #[must_use]
     pub const fn new(
         input_id: InputId,
-        query_fingerprint: Fingerprint,
+        source_lineage_fingerprint: Fingerprint,
         cursor_identity_fingerprint: Fingerprint,
         configuration_fingerprint: Fingerprint,
         configuration_generation: u64,
@@ -328,7 +369,7 @@ impl DurableInputState {
         Self {
             format_version: DURABLE_STATE_FORMAT_VERSION,
             input_id,
-            query_fingerprint,
+            source_lineage_fingerprint,
             cursor_identity_fingerprint,
             configuration_fingerprint,
             configuration_generation,
@@ -365,6 +406,8 @@ impl DurableInputState {
         }
         if let Some(scan) = &self.active_scan {
             scan.validate(&self.coordinator)?;
+        } else if self.coordinator.active_attempt.is_some() {
+            return Err(StateValidationError::ActiveAttemptWithoutScan);
         }
         Ok(())
     }
@@ -376,7 +419,10 @@ impl fmt::Debug for DurableInputState {
             .debug_struct("DurableInputState")
             .field("format_version", &self.format_version)
             .field("input_id", &self.input_id)
-            .field("query_fingerprint", &self.query_fingerprint)
+            .field(
+                "source_lineage_fingerprint",
+                &self.source_lineage_fingerprint,
+            )
             .field(
                 "cursor_identity_fingerprint",
                 &self.cursor_identity_fingerprint,
@@ -397,6 +443,7 @@ pub enum StateValidationError {
     InvalidCoordinator,
     ConfigurationFenceMismatch,
     ScanWithoutActiveAttempt,
+    ActiveAttemptWithoutScan,
     ScanAttemptMismatch,
     ScanBaseMismatch,
     InvalidNextPage,
@@ -410,6 +457,8 @@ pub enum StateValidationError {
     DuplicateSegment,
     RowCountOverflow,
     ScanCompletionMismatch,
+    DeliveryConfirmationMismatch,
+    InvalidDeliveryReceipt,
 }
 
 impl fmt::Display for StateValidationError {
@@ -421,6 +470,7 @@ impl fmt::Display for StateValidationError {
             Self::InvalidCoordinator => "checkpoint coordinator state is invalid",
             Self::ConfigurationFenceMismatch => "configuration fingerprint fence is inconsistent",
             Self::ScanWithoutActiveAttempt => "scan has no active checkpoint attempt",
+            Self::ActiveAttemptWithoutScan => "active checkpoint attempt has no durable scan",
             Self::ScanAttemptMismatch => "scan attempt fence is inconsistent",
             Self::ScanBaseMismatch => "scan base does not match the committed cursor",
             Self::InvalidNextPage => "scan page state is invalid",
@@ -436,6 +486,10 @@ impl fmt::Display for StateValidationError {
             Self::DuplicateSegment => "scan contains a duplicate segment",
             Self::RowCountOverflow => "scan row accounting overflowed",
             Self::ScanCompletionMismatch => "scan and collection completion are inconsistent",
+            Self::DeliveryConfirmationMismatch => {
+                "scan delivery confirmation is missing its complete receipt prefix"
+            }
+            Self::InvalidDeliveryReceipt => "scan delivery receipt is outside sealed progress",
         };
         formatter.write_str(message)
     }
@@ -519,9 +573,12 @@ mod tests {
             base_committed: state.coordinator.committed,
             resume_after: Some(candidate),
             maximum_candidate: Some(candidate),
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
             next_page: 2,
             complete: false,
             segments: vec![SegmentRef::new([0x51; 16], 1, 1, 1, [0x61; 32])],
+            delivered_through_sequence: 0,
         });
         assert_eq!(state.validate(), Ok(()));
 
@@ -535,6 +592,25 @@ mod tests {
         );
         state.active_scan.as_mut().expect("scan exists").complete = true;
         assert_eq!(state.validate(), Ok(()));
+    }
+
+    #[test]
+    fn active_attempt_requires_its_durable_scan() {
+        let mut state = state();
+        let fence = AttemptFence::new(
+            AttemptId::new([0x44; 16]),
+            configuration_fence(),
+            state.coordinator.generation,
+        );
+        state
+            .coordinator
+            .start_attempt(fence)
+            .expect("attempt starts");
+
+        assert_eq!(
+            state.validate(),
+            Err(StateValidationError::ActiveAttemptWithoutScan)
+        );
     }
 
     #[test]
@@ -556,13 +632,134 @@ mod tests {
             base_committed: state.coordinator.committed,
             resume_after: Some(candidate),
             maximum_candidate: Some(candidate),
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
             next_page: 2,
             complete: false,
             segments: vec![segment.clone(), segment],
+            delivered_through_sequence: 0,
         });
         assert!(matches!(
             state.validate(),
             Err(StateValidationError::InvalidSegmentOrder | StateValidationError::DuplicateSegment)
         ));
+    }
+
+    #[test]
+    fn empty_scan_requires_the_initial_next_page() {
+        let mut state = state();
+        let fence = AttemptFence::new(
+            AttemptId::new([0x44; 16]),
+            configuration_fence(),
+            state.coordinator.generation,
+        );
+        state
+            .coordinator
+            .start_attempt(fence)
+            .expect("attempt starts");
+        state.active_scan = Some(ActiveScan {
+            attempt_id: fence.attempt_id,
+            base_committed: state.coordinator.committed,
+            resume_after: None,
+            maximum_candidate: None,
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
+            next_page: 2,
+            complete: false,
+            segments: Vec::new(),
+            delivered_through_sequence: 0,
+        });
+
+        assert_eq!(state.validate(), Err(StateValidationError::InvalidNextPage));
+    }
+
+    #[test]
+    fn scan_requires_page_and_sequence_to_share_a_canonical_prefix() {
+        let mut state = state();
+        let fence = AttemptFence::new(
+            AttemptId::new([0x44; 16]),
+            configuration_fence(),
+            state.coordinator.generation,
+        );
+        state
+            .coordinator
+            .start_attempt(fence)
+            .expect("attempt starts");
+        let candidate = TimestampIdCursor::new(1_002, 12);
+        state.active_scan = Some(ActiveScan {
+            attempt_id: fence.attempt_id,
+            base_committed: state.coordinator.committed,
+            resume_after: Some(candidate),
+            maximum_candidate: Some(candidate),
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
+            next_page: 2,
+            complete: false,
+            segments: vec![
+                SegmentRef::new([0x51; 16], 1, 1, 1, [0x61; 32]),
+                SegmentRef::new([0x52; 16], 2, 1, 1, [0x62; 32]),
+            ],
+            delivered_through_sequence: 0,
+        });
+
+        assert_eq!(
+            state.validate(),
+            Err(StateValidationError::InvalidSegmentOrder)
+        );
+    }
+
+    #[test]
+    fn scan_delivery_receipt_cannot_exceed_its_sealed_prefix() {
+        let mut state = state();
+        let fence = AttemptFence::new(
+            AttemptId::new([0x44; 16]),
+            configuration_fence(),
+            state.coordinator.generation,
+        );
+        state
+            .coordinator
+            .start_attempt(fence)
+            .expect("attempt starts");
+        state.active_scan = Some(ActiveScan {
+            attempt_id: fence.attempt_id,
+            base_committed: state.coordinator.committed,
+            resume_after: None,
+            maximum_candidate: None,
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
+            next_page: 1,
+            complete: false,
+            segments: Vec::new(),
+            delivered_through_sequence: 1,
+        });
+        assert_eq!(
+            state.validate(),
+            Err(StateValidationError::InvalidDeliveryReceipt)
+        );
+
+        let candidate = TimestampIdCursor::new(1_001, 11);
+        state.active_scan = Some(ActiveScan {
+            attempt_id: fence.attempt_id,
+            base_committed: state.coordinator.committed,
+            resume_after: Some(candidate),
+            maximum_candidate: Some(candidate),
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
+            next_page: 2,
+            complete: false,
+            segments: vec![SegmentRef::new([0x51; 16], 1, 1, 1, [0x61; 32])],
+            delivered_through_sequence: 1,
+        });
+        assert_eq!(state.validate(), Ok(()));
+
+        state
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .delivered_through_sequence = 2;
+        assert_eq!(
+            state.validate(),
+            Err(StateValidationError::InvalidDeliveryReceipt)
+        );
     }
 }

@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ConnectionConfig, ConnectorError, ProbeReport, ResolvedSecret, TimestampIdCursorRequest,
-    ValidationReport,
+    TimestampIdCursorSpec, ValidationReport,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -146,6 +146,8 @@ pub struct ValidationRequest {
     pub connection: ConnectionConfig,
     pub query: Option<QueryText>,
     pub max_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<TimestampIdCursorSpec>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -323,6 +325,32 @@ mod tests {
             .remove("cursor");
         let legacy: ExecuteRequest =
             serde_json::from_value(legacy).expect("contract 1.0 request should deserialize");
+        assert_eq!(legacy.cursor, None);
+
+        let validation = ValidationRequest {
+            connection: connection(),
+            query: Some(QueryText::new(
+                "select updated_at, private_id from private_table",
+            )),
+            max_rows: Some(100),
+            cursor: Some(TimestampIdCursorSpec {
+                timestamp_field: "updated_at".into(),
+                id_field: "private_id".into(),
+                overlap: Duration::from_secs(1),
+                null_policy: crate::CursorNullPolicy::Reject,
+            }),
+        };
+        let encoded = serde_json::to_vec(&validation).expect("validation should serialize");
+        let decoded: ValidationRequest =
+            serde_json::from_slice(&encoded).expect("validation should deserialize");
+        assert_eq!(decoded, validation);
+        let mut legacy = serde_json::to_value(&validation).expect("validation should become JSON");
+        legacy
+            .as_object_mut()
+            .expect("validation JSON must be an object")
+            .remove("cursor");
+        let legacy: ValidationRequest =
+            serde_json::from_value(legacy).expect("legacy validation should deserialize");
         assert_eq!(legacy.cursor, None);
 
         let batch = ArrowIpcBatch {

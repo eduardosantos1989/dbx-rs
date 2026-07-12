@@ -1,18 +1,20 @@
 //! Immutable, redacted input preparation for daemon workers.
 //!
 //! File-backed query and database CA assets are resolved before a worker is spawned. Fingerprints
-//! intentionally exclude file paths and secret values. Batch input identity is currently derived
-//! from the stanza name; rising inputs will require an explicit immutable input identifier before
-//! scheduled rising collection is enabled.
+//! intentionally exclude file paths and secret values. Batch identity is derived from the stanza
+//! name, while rising identity is derived from its explicit immutable UUID.
 
 use std::fmt;
 use std::time::Duration;
 
 use dbx_rs_config::{
-    HecConfig, HecInputManagement, HecState, IndexerAcknowledgment, InputConfig, MAX_QUERY_BYTES,
-    MAX_TLS_CA_BYTES, QuerySource, TlsVerification,
+    CollectionMode, HecConfig, HecInputManagement, HecState, IndexerAcknowledgment, InputConfig,
+    MAX_QUERY_BYTES, MAX_TLS_CA_BYTES, QuerySource, TlsVerification,
 };
-use dbx_rs_connector_sdk::{CONNECTOR_CONTRACT_VERSION, ConnectionConfig, QueryText, TlsMode};
+use dbx_rs_connector_sdk::{
+    CONNECTOR_CONTRACT_VERSION, ConnectionConfig, CursorNullPolicy, QueryText,
+    TIMESTAMP_ID_CURSOR_FORMAT_VERSION, TimestampIdCursorSpec, TlsMode,
+};
 use dbx_rs_secure_store::read_limited;
 use ring::digest::{Context, SHA256};
 
@@ -25,8 +27,12 @@ const INPUT_ID_DOMAIN: &[u8] = b"dbx-rs/batch-input-id/v1\0";
 const QUERY_FINGERPRINT_DOMAIN: &[u8] = b"dbx-rs/query-fingerprint/v1\0";
 const LINEAGE_FINGERPRINT_DOMAIN: &[u8] = b"dbx-rs/lineage-fingerprint/v1\0";
 const REVISION_FINGERPRINT_DOMAIN: &[u8] = b"dbx-rs/revision-fingerprint/v1\0";
+const RISING_INPUT_KEY_DOMAIN: &[u8] = b"dbx-rs/rising-input-key/v1\0";
+const RISING_LINEAGE_FINGERPRINT_DOMAIN: &[u8] = b"dbx-rs/rising-source-lineage-fingerprint/v1\0";
+const RISING_CURSOR_FINGERPRINT_DOMAIN: &[u8] = b"dbx-rs/rising-cursor-identity-fingerprint/v1\0";
+const RISING_REVISION_FINGERPRINT_DOMAIN: &[u8] = b"dbx-rs/rising-revision-fingerprint/v1\0";
 
-/// Stable opaque identity for a batch input stanza.
+/// Stable opaque 32-byte spool identity for a prepared input.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct BatchInputId([u8; 32]);
 
@@ -57,6 +63,25 @@ impl ConfigurationFingerprint {
 impl fmt::Debug for ConfigurationFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ConfigurationFingerprint([REDACTED])")
+    }
+}
+
+/// State identity and cursor contract for a rising input.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreparedRising {
+    pub state_input_id: [u8; 16],
+    pub cursor_spec: TimestampIdCursorSpec,
+    pub cursor_identity_fingerprint: ConfigurationFingerprint,
+}
+
+impl fmt::Debug for PreparedRising {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedRising")
+            .field("state_input_id", &"[REDACTED]")
+            .field("cursor_spec", &"[REDACTED]")
+            .field("cursor_identity_fingerprint", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -95,6 +120,7 @@ impl fmt::Debug for PreparedOutput {
 #[derive(Clone, Eq, PartialEq)]
 pub struct PreparedInput {
     pub input_id: BatchInputId,
+    pub rising: Option<PreparedRising>,
     pub name: String,
     pub connector: String,
     pub secret_ref: String,
@@ -108,11 +134,18 @@ pub struct PreparedInput {
     pub revision_fingerprint: ConfigurationFingerprint,
 }
 
+struct PreparedIdentity {
+    input_id: BatchInputId,
+    rising: Option<PreparedRising>,
+    lineage_fingerprint: ConfigurationFingerprint,
+}
+
 impl fmt::Debug for PreparedInput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedInput")
             .field("input_id", &"[REDACTED]")
+            .field("rising", &self.rising)
             .field("name", &self.name)
             .field("connector", &self.connector)
             .field("secret_ref", &"[REDACTED]")
@@ -136,7 +169,8 @@ impl fmt::Debug for PreparedInput {
 /// # Errors
 ///
 /// Returns a redacted error when the configured query or CA cannot be read within its bound, the
-/// query is not UTF-8, the TLS mode is invalid, or a canonical fingerprint field is too large.
+/// query is not UTF-8, TLS or cursor configuration is invalid, or a canonical fingerprint field
+/// is too large.
 pub fn prepare_input(input: &InputConfig, hec: &HecConfig) -> Result<PreparedInput, DaemonError> {
     let query = resolve_query(&input.query)?;
     let tls_ca_pem = input
@@ -171,19 +205,31 @@ pub fn prepare_input(input: &InputConfig, hec: &HecConfig) -> Result<PreparedInp
         connect_timeout: input.connect_timeout,
         probe_timeout: input.probe_timeout,
     };
-    let input_id = batch_input_id(&input.name)?;
     let query_fingerprint = query_fingerprint(&input.connector, query.as_bytes())?;
-    let lineage_fingerprint = lineage_fingerprint(input_id, input, query_fingerprint)?;
-    let revision_fingerprint = revision_fingerprint(
+    let PreparedIdentity {
+        input_id,
+        rising,
+        lineage_fingerprint,
+    } = prepare_identity(input, query_fingerprint)?;
+    let operational_revision_fingerprint = revision_fingerprint(
         lineage_fingerprint,
         input,
         hec,
         connection.tls_mode,
         connection.tls_ca_pem.as_deref(),
     )?;
+    let revision_fingerprint = match &rising {
+        Some(rising) => rising_revision_fingerprint(
+            operational_revision_fingerprint,
+            rising.cursor_identity_fingerprint,
+            rising.cursor_spec.overlap,
+        ),
+        None => operational_revision_fingerprint,
+    };
 
     Ok(PreparedInput {
         input_id,
+        rising,
         name: input.name.clone(),
         connector: input.connector.clone(),
         secret_ref: input.secret_ref.clone(),
@@ -207,6 +253,53 @@ pub fn prepare_input(input: &InputConfig, hec: &HecConfig) -> Result<PreparedInp
         lineage_fingerprint,
         revision_fingerprint,
     })
+}
+
+fn prepare_identity(
+    input: &InputConfig,
+    query_fingerprint: ConfigurationFingerprint,
+) -> Result<PreparedIdentity, DaemonError> {
+    match &input.mode {
+        CollectionMode::Batch => {
+            let input_id = batch_input_id(&input.name)?;
+            let lineage_fingerprint =
+                batch_lineage_fingerprint(input_id, input, query_fingerprint)?;
+            Ok(PreparedIdentity {
+                input_id,
+                rising: None,
+                lineage_fingerprint,
+            })
+        }
+        CollectionMode::Rising(configured) => {
+            let state_input_id = configured.input_id.into_bytes();
+            let input_id = rising_input_key(state_input_id);
+            let cursor_spec = TimestampIdCursorSpec {
+                timestamp_field: configured.timestamp_field.clone(),
+                id_field: configured.id_field.clone(),
+                overlap: configured.overlap,
+                null_policy: CursorNullPolicy::Reject,
+            };
+            cursor_spec.validate().map_err(|_| {
+                preparation_error(
+                    "DBX-RS-PREP-0006",
+                    "cursor_configuration",
+                    "configured rising cursor is invalid",
+                )
+            })?;
+            let cursor_identity_fingerprint = cursor_identity_fingerprint(&cursor_spec)?;
+            let lineage_fingerprint =
+                rising_lineage_fingerprint(state_input_id, input, query_fingerprint)?;
+            Ok(PreparedIdentity {
+                input_id,
+                rising: Some(PreparedRising {
+                    state_input_id,
+                    cursor_spec,
+                    cursor_identity_fingerprint,
+                }),
+                lineage_fingerprint,
+            })
+        }
+    }
 }
 
 fn resolve_query(source: &QuerySource) -> Result<String, DaemonError> {
@@ -239,6 +332,13 @@ fn batch_input_id(name: &str) -> Result<BatchInputId, DaemonError> {
     Ok(BatchInputId(encoder.finish()))
 }
 
+fn rising_input_key(state_input_id: [u8; 16]) -> BatchInputId {
+    let mut encoder = FingerprintEncoder::new(RISING_INPUT_KEY_DOMAIN);
+    encoder.u16(1, PREPARED_FINGERPRINT_VERSION);
+    encoder.fixed_bytes_16(2, &state_input_id);
+    BatchInputId(encoder.finish())
+}
+
 fn query_fingerprint(
     connector: &str,
     query: &[u8],
@@ -252,7 +352,7 @@ fn query_fingerprint(
     Ok(ConfigurationFingerprint(encoder.finish()))
 }
 
-fn lineage_fingerprint(
+fn batch_lineage_fingerprint(
     input_id: BatchInputId,
     input: &InputConfig,
     query_fingerprint: ConfigurationFingerprint,
@@ -266,6 +366,53 @@ fn lineage_fingerprint(
     encoder.bytes(6, input.username.as_bytes())?;
     encoder.fixed_bytes(7, &query_fingerprint.into_bytes());
     Ok(ConfigurationFingerprint(encoder.finish()))
+}
+
+fn rising_lineage_fingerprint(
+    state_input_id: [u8; 16],
+    input: &InputConfig,
+    query_fingerprint: ConfigurationFingerprint,
+) -> Result<ConfigurationFingerprint, DaemonError> {
+    let mut encoder = FingerprintEncoder::new(RISING_LINEAGE_FINGERPRINT_DOMAIN);
+    encoder.u16(1, PREPARED_FINGERPRINT_VERSION);
+    encoder.fixed_bytes_16(2, &state_input_id);
+    encoder.bytes(3, input.connector.as_bytes())?;
+    encoder.u16(4, CONNECTOR_CONTRACT_VERSION.major);
+    encoder.u16(5, CONNECTOR_CONTRACT_VERSION.minor);
+    encoder.bytes(6, input.host.as_bytes())?;
+    encoder.u16(7, input.port);
+    encoder.bytes(8, input.database.as_bytes())?;
+    encoder.bytes(9, input.username.as_bytes())?;
+    encoder.fixed_bytes(10, &query_fingerprint.into_bytes());
+    Ok(ConfigurationFingerprint(encoder.finish()))
+}
+
+fn cursor_identity_fingerprint(
+    cursor_spec: &TimestampIdCursorSpec,
+) -> Result<ConfigurationFingerprint, DaemonError> {
+    let mut encoder = FingerprintEncoder::new(RISING_CURSOR_FINGERPRINT_DOMAIN);
+    encoder.u16(1, PREPARED_FINGERPRINT_VERSION);
+    encoder.u16(2, CONNECTOR_CONTRACT_VERSION.major);
+    encoder.u16(3, CONNECTOR_CONTRACT_VERSION.minor);
+    encoder.u16(4, TIMESTAMP_ID_CURSOR_FORMAT_VERSION);
+    encoder.bytes(5, cursor_spec.timestamp_field.as_bytes())?;
+    encoder.bytes(6, cursor_spec.id_field.as_bytes())?;
+    encoder.u8(7, cursor_null_policy_tag(cursor_spec.null_policy));
+    Ok(ConfigurationFingerprint(encoder.finish()))
+}
+
+fn rising_revision_fingerprint(
+    operational_revision: ConfigurationFingerprint,
+    cursor_identity: ConfigurationFingerprint,
+    overlap: Duration,
+) -> ConfigurationFingerprint {
+    let mut encoder = FingerprintEncoder::new(RISING_REVISION_FINGERPRINT_DOMAIN);
+    encoder.u16(1, PREPARED_FINGERPRINT_VERSION);
+    encoder.fixed_bytes(2, &operational_revision.into_bytes());
+    encoder.u8(3, 1);
+    encoder.fixed_bytes(4, &cursor_identity.into_bytes());
+    encoder.duration(5, overlap);
+    ConfigurationFingerprint(encoder.finish())
 }
 
 fn revision_fingerprint(
@@ -344,6 +491,12 @@ const fn acknowledgment_tag(acknowledgment: IndexerAcknowledgment) -> u8 {
     }
 }
 
+const fn cursor_null_policy_tag(policy: CursorNullPolicy) -> u8 {
+    match policy {
+        CursorNullPolicy::Reject => 0,
+    }
+}
+
 struct FingerprintEncoder {
     context: Context,
 }
@@ -394,6 +547,11 @@ impl FingerprintEncoder {
     }
 
     fn fixed_bytes(&mut self, tag: u8, value: &[u8; 32]) {
+        self.context.update(&[tag]);
+        self.context.update(value);
+    }
+
+    fn fixed_bytes_16(&mut self, tag: u8, value: &[u8; 16]) {
         self.context.update(&[tag]);
         self.context.update(value);
     }
@@ -454,7 +612,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use dbx_rs_config::HecInputManagement;
+    use dbx_rs_config::{HecInputManagement, load_effective_config};
 
     use super::*;
 
@@ -484,6 +642,7 @@ mod tests {
         InputConfig {
             name: "orders".into(),
             disabled: false,
+            mode: CollectionMode::Batch,
             connector: "postgres".into(),
             interval: Duration::from_mins(1),
             host: "private-db.example".into(),
@@ -528,6 +687,59 @@ mod tests {
 
     fn write(path: &Path, bytes: &[u8]) {
         fs::write(path, bytes).expect("test asset must be written");
+    }
+
+    fn parsed_input(mode_settings: &str) -> (InputConfig, HecConfig) {
+        let directory = TestDirectory::new();
+        let app_home = directory.0.join("app");
+        let splunk_home = directory.0.join("splunk");
+        fs::create_dir_all(app_home.join("default"))
+            .expect("default configuration directory must be created");
+        fs::create_dir_all(app_home.join("local"))
+            .expect("local configuration directory must be created");
+        write(
+            &app_home.join("default/dbxrs_generic.conf"),
+            include_bytes!("../../../packaging/splunk/TA-dbx-rs/default/dbxrs_generic.conf"),
+        );
+        let configured = format!(
+            r"[orders]
+disabled = false
+{mode_settings}
+connector = postgres
+interval_secs = 60
+host = private-db.example
+port = 5432
+database = private_database
+username = private_user
+secret_ref = local:private-secret
+tls_mode = disable
+query = SELECT private_column FROM private_table
+connect_timeout_secs = 10
+probe_timeout_secs = 10
+max_rows = 1000
+max_bytes = 1000000
+query_timeout_secs = 30
+index = private_index
+sourcetype = private:sourcetype
+source = private:source
+"
+        );
+        write(
+            &app_home.join("default/dbxrs_inputs.conf"),
+            configured.as_bytes(),
+        );
+
+        let mut effective =
+            load_effective_config(&app_home, &splunk_home).expect("test configuration must load");
+        (effective.inputs.remove(0), effective.generic.hec)
+    }
+
+    fn parsed_rising_input() -> (InputConfig, HecConfig) {
+        parsed_input(
+            "mode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\n\
+             cursor_timestamp_field = private_updated_at\ncursor_id_field = private_row_id\n\
+             cursor_overlap_secs = 10",
+        )
     }
 
     #[test]
@@ -603,6 +815,31 @@ mod tests {
     }
 
     #[test]
+    fn rising_revision_binds_delivery_transport_and_event_limit() {
+        let (configured, base_hec) = parsed_rising_input();
+        let base = prepare_input(&configured, &base_hec).expect("base rising input must prepare");
+        let mut changed_hec = base_hec.clone();
+        changed_hec.url = "https://replacement-hec.example/services/collector/event".into();
+        changed_hec.batch_max_events += 1;
+        changed_hec.acknowledgment = IndexerAcknowledgment::Disabled;
+        let transport_changed =
+            prepare_input(&configured, &changed_hec).expect("transport change must prepare");
+
+        assert_ne!(
+            base.revision_fingerprint,
+            transport_changed.revision_fingerprint
+        );
+
+        changed_hec.max_event_bytes += 1;
+        let event_limit_changed =
+            prepare_input(&configured, &changed_hec).expect("event-limit change must prepare");
+        assert_ne!(
+            base.revision_fingerprint,
+            event_limit_changed.revision_fingerprint
+        );
+    }
+
+    #[test]
     fn batch_identity_is_stable_and_name_scoped() {
         let first = prepare_input(&input(QuerySource::Inline("SELECT 1".into()), None), &hec())
             .expect("first input must prepare");
@@ -614,6 +851,162 @@ mod tests {
 
         assert_eq!(first.input_id, second.input_id);
         assert_ne!(first.input_id, renamed.input_id);
+    }
+
+    #[test]
+    fn implicit_and_explicit_batch_modes_prepare_identically() {
+        let (implicit, implicit_hec) = parsed_input("");
+        let (explicit, explicit_hec) = parsed_input("mode = batch");
+
+        assert_eq!(implicit, explicit);
+        assert_eq!(implicit_hec, explicit_hec);
+        let implicit =
+            prepare_input(&implicit, &implicit_hec).expect("implicit batch input must prepare");
+        let explicit =
+            prepare_input(&explicit, &explicit_hec).expect("explicit batch input must prepare");
+
+        assert_eq!(implicit, explicit);
+        assert!(implicit.rising.is_none());
+    }
+
+    #[test]
+    fn batch_v1_identity_and_fingerprints_have_stable_vectors() {
+        let prepared = prepare_input(&input(QuerySource::Inline("SELECT 1".into()), None), &hec())
+            .expect("batch input must prepare");
+
+        assert_eq!(
+            (
+                prepared.input_id.into_bytes(),
+                prepared.query_fingerprint.into_bytes(),
+                prepared.lineage_fingerprint.into_bytes(),
+                prepared.revision_fingerprint.into_bytes(),
+            ),
+            (
+                [
+                    0x8d, 0x31, 0xd4, 0x90, 0x73, 0x23, 0xa0, 0x0d, 0xc5, 0x04, 0x01, 0x2b, 0xc7,
+                    0x93, 0x54, 0x38, 0xe7, 0x6d, 0xa6, 0xd7, 0x51, 0x00, 0x91, 0x5e, 0x75, 0x89,
+                    0x25, 0xcd, 0xa1, 0xd9, 0x25, 0xfd,
+                ],
+                [
+                    0x6a, 0x19, 0x39, 0x89, 0x72, 0x45, 0xf9, 0x9b, 0xae, 0x4f, 0x59, 0x80, 0xae,
+                    0xc6, 0x30, 0x42, 0x9f, 0x32, 0x71, 0xbd, 0xb1, 0xf6, 0x76, 0x2d, 0x46, 0x05,
+                    0x95, 0xd6, 0x6e, 0x25, 0x91, 0x59,
+                ],
+                [
+                    0x5d, 0x79, 0x73, 0x26, 0xb7, 0xbb, 0x9a, 0x44, 0x50, 0xb2, 0x73, 0x5e, 0x8a,
+                    0xc2, 0x79, 0x3f, 0xbe, 0x58, 0x27, 0x9b, 0xef, 0xd1, 0xdd, 0x9e, 0xe3, 0xdb,
+                    0x32, 0x0a, 0xeb, 0xfa, 0x77, 0x2f,
+                ],
+                [
+                    0xaa, 0x84, 0xd1, 0xde, 0x6b, 0x84, 0x77, 0xec, 0x68, 0xd8, 0xbe, 0xf2, 0x95,
+                    0x01, 0x71, 0xa2, 0x9c, 0x3a, 0x7d, 0xfc, 0xfd, 0xa5, 0xbf, 0x2e, 0xc7, 0xaf,
+                    0xd0, 0x25, 0x5f, 0x38, 0x28, 0x11,
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn rising_identity_and_fingerprints_are_stable_across_stanza_rename() {
+        let (configured, hec) = parsed_rising_input();
+        let first = prepare_input(&configured, &hec).expect("rising input must prepare");
+        let mut renamed = configured;
+        renamed.name = "private-renamed-orders".into();
+        let renamed = prepare_input(&renamed, &hec).expect("renamed rising input must prepare");
+
+        assert_eq!(first.input_id, renamed.input_id);
+        assert_eq!(first.rising, renamed.rising);
+        assert_eq!(first.query_fingerprint, renamed.query_fingerprint);
+        assert_eq!(first.lineage_fingerprint, renamed.lineage_fingerprint);
+        assert_eq!(first.revision_fingerprint, renamed.revision_fingerprint);
+    }
+
+    #[test]
+    fn rising_overlap_only_changes_revision_identity() {
+        let (configured, hec) = parsed_rising_input();
+        let base = prepare_input(&configured, &hec).expect("rising input must prepare");
+        let mut changed = configured;
+        let CollectionMode::Rising(rising) = &mut changed.mode else {
+            panic!("test input must be rising");
+        };
+        rising.overlap += Duration::from_secs(1);
+        let changed = prepare_input(&changed, &hec).expect("changed rising input must prepare");
+
+        assert_eq!(base.input_id, changed.input_id);
+        assert_eq!(base.lineage_fingerprint, changed.lineage_fingerprint);
+        assert_eq!(
+            base.rising
+                .as_ref()
+                .expect("base must be rising")
+                .cursor_identity_fingerprint,
+            changed
+                .rising
+                .as_ref()
+                .expect("changed input must be rising")
+                .cursor_identity_fingerprint
+        );
+        assert_ne!(base.revision_fingerprint, changed.revision_fingerprint);
+    }
+
+    #[test]
+    fn rising_source_and_query_changes_change_lineage() {
+        let (configured, hec) = parsed_rising_input();
+        let base = prepare_input(&configured, &hec).expect("rising input must prepare");
+
+        let mut changed_source = configured.clone();
+        changed_source.host = "different-private-db.example".into();
+        let changed_source =
+            prepare_input(&changed_source, &hec).expect("source change must prepare");
+
+        let mut changed_query = configured;
+        changed_query.query = QuerySource::Inline("SELECT private_other FROM private_table".into());
+        let changed_query = prepare_input(&changed_query, &hec).expect("query change must prepare");
+
+        assert_ne!(base.lineage_fingerprint, changed_source.lineage_fingerprint);
+        assert_ne!(base.lineage_fingerprint, changed_query.lineage_fingerprint);
+        assert_ne!(base.query_fingerprint, changed_query.query_fingerprint);
+    }
+
+    #[test]
+    fn rising_cursor_alias_change_only_changes_cursor_and_revision_identity() {
+        let (configured, hec) = parsed_rising_input();
+        let base = prepare_input(&configured, &hec).expect("rising input must prepare");
+        let mut changed = configured;
+        let CollectionMode::Rising(rising) = &mut changed.mode else {
+            panic!("test input must be rising");
+        };
+        rising.timestamp_field = "private_changed_at".into();
+        let changed = prepare_input(&changed, &hec).expect("cursor change must prepare");
+
+        assert_eq!(base.input_id, changed.input_id);
+        assert_eq!(base.lineage_fingerprint, changed.lineage_fingerprint);
+        assert_ne!(
+            base.rising
+                .as_ref()
+                .expect("base must be rising")
+                .cursor_identity_fingerprint,
+            changed
+                .rising
+                .as_ref()
+                .expect("changed input must be rising")
+                .cursor_identity_fingerprint
+        );
+        assert_ne!(base.revision_fingerprint, changed.revision_fingerprint);
+    }
+
+    #[test]
+    fn rising_debug_redacts_state_identity_and_cursor_aliases() {
+        let (configured, hec) = parsed_rising_input();
+        let prepared = prepare_input(&configured, &hec).expect("rising input must prepare");
+        let rising = prepared.rising.as_ref().expect("input must be rising");
+        let debug = format!("{prepared:?}");
+
+        assert!(!debug.contains("private_updated_at"));
+        assert!(!debug.contains("private_row_id"));
+        assert!(!debug.contains("123e4567"));
+        assert!(!debug.contains(&format!("{:?}", rising.state_input_id)));
+        assert!(!debug.contains(&format!("{:?}", prepared.input_id.into_bytes())));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

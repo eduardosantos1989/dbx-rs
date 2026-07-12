@@ -14,7 +14,12 @@ encrypted spool quotas, and HEC transport settings. Put overrides in `local/dbxr
 `default/dbxrs_inputs.conf` is intentionally empty. Put database stanzas in
 `local/dbxrs_inputs.conf`; see `README/dbxrs_inputs.conf.example` and the `.conf.spec` files. A
 stanza references a credential by `local:<name>`. Plaintext password, secret, token, and connection
-string settings are rejected.
+string settings are rejected. Omitted `mode` defaults to `batch`. PostgreSQL `rising` mode requires
+an immutable, unique, non-nil `input_id` and distinct timestamp and integer cursor aliases; see the
+input specification before enabling a rising stanza. Identity migration and checkpoint reset are
+not implemented, so do not change an established rising identity. Rising base queries cannot
+contain `LIMIT`, `OFFSET`, or `FETCH`; connector preparation rejects those clauses so the daemon
+owns the complete outer cursor scan and page limit.
 
 Put PostgreSQL query files in `queries/psql/` and PostgreSQL CA bundles in `certs/psql/`. Input
 stanzas may instead use `query = ...` for short inline SQL, but `query` and `query_file` are mutually
@@ -87,6 +92,11 @@ not generate files under `local/` except the managed HEC `inputs.conf` that Splu
 in the configuration layer. Back up the spool key together with retained spool files; losing that
 key makes those segments intentionally unreadable.
 
+On its first run, the daemon creates the owner-only fixed marker
+`$SPLUNK_HOME/var/lib/splunk/dbx-rs/state-root.binding` and binds the installation to the exact
+configured `state_dir`. That path is immutable afterward; state-root relocation and migration are
+not implemented. Back up and restore the marker with the checkpoint state.
+
 ## HEC bootstrap
 
 With `manage_input = true`, bootstrap generates one stable UUID token, a private local CA, and a
@@ -143,20 +153,35 @@ With indexer acknowledgment enabled, a segment becomes delivered only after all 
 acknowledged. Without it, HTTP acceptance is the configured weaker boundary. A crash or lost
 response after Splunk accepted data but before the local lifecycle rename can replay the same event,
 so this is durable at-least-once delivery rather than universal exactly-once delivery. Every frozen
-HEC envelope carries a stable `dbxrs_event_id` field derived from opaque input, batch, and row
-identities so downstream searches can identify replay duplicates without changing the database row.
+batch HEC envelope carries a stable `dbxrs_event_id` derived from opaque input, batch, and row
+identities. Rising event identity additionally binds the source lineage, cursor contract, and
+canonical cursor tuple, so overlap reads, page retries, and restarts retain the same identity.
+Downstream searches can use this field to identify replay duplicates without changing the database
+row.
 
-The connector and native adapter implement a typed timestamp-plus-ID cursor and return an
-uncommitted checkpoint candidate plus a distinct scan-resume cursor for bounded overlap pages. The
-versioned checkpoint repository can persist delivery-gated cursor and scan state with atomic
-revision fencing and explicit backup restore, but scheduled rising inputs do not use it yet. The
-current scheduler remains batch-only; no persistent database cursor advances. Do not configure a
-batch query that depends on rising semantics until that final coordinator integration is released.
+For PostgreSQL rising inputs, the daemon creates an active attempt and durable scan before page
+collection. The connector binds the committed and scan-resume positions as native parameters and
+returns an uncommitted checkpoint candidate plus a distinct resume cursor. Each non-empty bounded
+page is sealed with authenticated recovery metadata before it is referenced by checkpoint state.
+Startup reconciliation validates that metadata against the input identity, configuration fence,
+attempt, page, cursor contract, and requested bounds before adopting or replaying the segment.
+
+The checkpoint repository records delivery as an exact sequential prefix, one segment at a time.
+A receipted segment is compacted without being resent during recovery. The committed cursor advances
+only after the scan is complete, the full receipt prefix is durable, and the coordinator confirms
+that every page crossed the configured HEC boundary. An empty final page completes the scan without
+advancing beyond the greatest candidate already sealed. These rules preserve recovery safety but do
+not remove at-least-once replay at the HEC boundary.
 
 The spool and checkpoint formats are persistent. To roll back, stop the daemon and preserve the
-complete spool root, spool key, and `state_dir`. A binary that does not understand format v1 must
-not touch those files. Restore a format-v1-capable binary with the matching state and key, then
-validate both inventories before collection resumes; deleting retained data is not a rollback
+complete spool root, spool key, `state_dir`, and state-root binding marker as one matched set. New
+spool segments use format v2; the current reader accepts v1 and v2, but a v1-only binary cannot read
+v2 segments. Checkpoint files retain envelope version 1 and now carry durable payload format 2,
+which a payload-v1-only binary cannot read. Do not start an older binary while incompatible retained
+data exists. A v2-capable binary can drain every v2 spool segment, but draining does not downgrade a
+rising checkpoint. Rollback of a rising installation to a payload-v1-only binary therefore requires
+restoration of a matched pre-v2 state, spool, key, and binding-marker backup. Retaining any v2
+segment requires continuing to use a v2-capable binary; deleting retained data is not a rollback
 procedure. Upgrade preflight also validates that each input's row and byte limits fit one complete
 configured spool segment; lower those limits or raise the bounded segment limit before restarting.
 

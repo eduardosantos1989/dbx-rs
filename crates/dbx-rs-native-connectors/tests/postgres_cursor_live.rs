@@ -67,7 +67,7 @@ async fn timestamp_id_cursor_does_not_skip_equal_timestamp_rows() {
         }),
     };
     let (line_tx, mut line_rx) = mpsc::channel(4);
-    let collect = provider.collect_json_lines(request, &secret, line_tx, CancellationToken::new());
+    let collect = provider.collect_json_rows(request, &secret, line_tx, CancellationToken::new());
     let receive = async move {
         let mut lines = Vec::new();
         while let Some(line) = line_rx.recv().await {
@@ -118,7 +118,7 @@ async fn overlap_includes_the_exact_timestamp_and_minimum_identifier_boundary() 
         }),
     };
     let (line_tx, mut line_rx) = mpsc::channel(4);
-    let collect = provider.collect_json_lines(request, &secret, line_tx, CancellationToken::new());
+    let collect = provider.collect_json_rows(request, &secret, line_tx, CancellationToken::new());
     let receive = async move {
         let mut count = 0_usize;
         while line_rx.recv().await.is_some() {
@@ -168,7 +168,7 @@ async fn scan_resume_is_exclusive_and_does_not_reapply_overlap() {
         }),
     };
     let (line_tx, mut line_rx) = mpsc::channel(4);
-    let collect = provider.collect_json_lines(request, &secret, line_tx, CancellationToken::new());
+    let collect = provider.collect_json_rows(request, &secret, line_tx, CancellationToken::new());
     let receive = async move {
         let mut lines = Vec::new();
         while let Some(line) = line_rx.recv().await {
@@ -183,7 +183,8 @@ async fn scan_resume_is_exclusive_and_does_not_reapply_overlap() {
     let ids = lines
         .iter()
         .map(|line| {
-            serde_json::from_slice::<serde_json::Value>(line).expect("live row must be JSON")["id"]
+            serde_json::from_slice::<serde_json::Value>(line.as_bytes())
+                .expect("live row must be JSON")["id"]
                 .as_i64()
                 .expect("live row ID must be signed 64-bit")
         })
@@ -222,7 +223,7 @@ async fn committed_cursor_rejects_null_rows_instead_of_filtering_them() {
         }),
     };
     let (line_tx, mut line_rx) = mpsc::channel(4);
-    let collect = provider.collect_json_lines(request, &secret, line_tx, CancellationToken::new());
+    let collect = provider.collect_json_rows(request, &secret, line_tx, CancellationToken::new());
     let receive = async move {
         let mut count = 0_usize;
         while line_rx.recv().await.is_some() {
@@ -265,7 +266,7 @@ async fn duplicate_tuple_in_truncation_probe_fails_instead_of_being_skipped() {
         }),
     };
     let (line_tx, mut line_rx) = mpsc::channel(2);
-    let collect = provider.collect_json_lines(request, &secret, line_tx, CancellationToken::new());
+    let collect = provider.collect_json_rows(request, &secret, line_tx, CancellationToken::new());
     let receive = async move {
         let mut count = 0_usize;
         while line_rx.recv().await.is_some() {

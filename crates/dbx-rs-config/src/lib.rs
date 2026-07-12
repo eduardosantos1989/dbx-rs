@@ -26,6 +26,7 @@ pub const MAX_TLS_CA_BYTES: u64 = 1024 * 1024;
 const GENERIC_FILE: &str = "dbxrs_generic.conf";
 const INPUTS_FILE: &str = "dbxrs_inputs.conf";
 const MAX_LABEL_BYTES: usize = 128;
+const MAX_POSTGRES_IDENTIFIER_BYTES: usize = 63;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveConfig {
@@ -142,6 +143,7 @@ pub enum IndexerAcknowledgment {
 pub struct InputConfig {
     pub name: String,
     pub disabled: bool,
+    pub mode: CollectionMode,
     pub connector: String,
     pub interval: Duration,
     pub host: String,
@@ -161,6 +163,48 @@ pub struct InputConfig {
     pub index: String,
     pub sourcetype: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CollectionMode {
+    Batch,
+    Rising(RisingInputConfig),
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct RisingInputConfig {
+    pub input_id: RisingInputId,
+    pub timestamp_field: String,
+    pub id_field: String,
+    pub overlap: Duration,
+}
+
+impl std::fmt::Debug for RisingInputConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RisingInputConfig")
+            .field("input_id", &self.input_id)
+            .field("timestamp_field", &"[REDACTED]")
+            .field("id_field", &"[REDACTED]")
+            .field("overlap", &self.overlap)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct RisingInputId([u8; 16]);
+
+impl RisingInputId {
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for RisingInputId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RisingInputId([REDACTED])")
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -505,6 +549,11 @@ fn parse_inputs(
 ) -> Result<Vec<InputConfig>, ConfigError> {
     const ALLOWED: &[&str] = &[
         "disabled",
+        "mode",
+        "input_id",
+        "cursor_timestamp_field",
+        "cursor_id_field",
+        "cursor_overlap_secs",
         "connector",
         "interval_secs",
         "host",
@@ -527,6 +576,7 @@ fn parse_inputs(
         "source",
     ];
     let mut inputs = Vec::new();
+    let mut rising_input_ids = HashSet::new();
     for (name, values) in ini.get_map_ref() {
         validate_label(name, "input.name")?;
         if values.keys().any(|key| {
@@ -540,7 +590,13 @@ fn parse_inputs(
         if values.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
             return Err(ConfigError::new("DBX-RS-CFG-0012", "input.setting"));
         }
-        inputs.push(parse_input(ini, name, app_home, splunk_home, generic)?);
+        let input = parse_input(ini, name, app_home, splunk_home, generic)?;
+        if let CollectionMode::Rising(rising) = &input.mode
+            && !rising_input_ids.insert(rising.input_id)
+        {
+            return Err(ConfigError::new("DBX-RS-CFG-0060", "input.input_id"));
+        }
+        inputs.push(input);
     }
     inputs.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(inputs)
@@ -553,6 +609,7 @@ fn parse_input(
     splunk_home: &Path,
     generic: &GenericConfig,
 ) -> Result<InputConfig, ConfigError> {
+    let mode = parse_collection_mode(ini, name)?;
     let connector = required_label(ini, name, "connector")?;
     if connector != "postgres" {
         return Err(ConfigError::new("DBX-RS-CFG-0014", "input.connector"));
@@ -600,6 +657,7 @@ fn parse_input(
     Ok(InputConfig {
         name: name.into(),
         disabled: required_bool(ini, name, "disabled")?,
+        mode,
         connector: connector.clone(),
         interval: Duration::from_secs(interval_secs),
         host: required_nonempty(ini, name, "host")?,
@@ -628,6 +686,133 @@ fn parse_input(
             .unwrap_or_else(|| generic.hec.sourcetype.clone()),
         source: optional_label(ini, name, "source")?.unwrap_or_else(|| generic.hec.source.clone()),
     })
+}
+
+fn parse_collection_mode(ini: &Ini, section: &str) -> Result<CollectionMode, ConfigError> {
+    const RISING_KEYS: &[&str] = &[
+        "input_id",
+        "cursor_timestamp_field",
+        "cursor_id_field",
+        "cursor_overlap_secs",
+    ];
+
+    let mode = if has_setting(ini, section, "mode") {
+        required(ini, section, "mode")
+            .map_err(|_| ConfigError::new("DBX-RS-CFG-0054", "input.mode"))?
+    } else {
+        "batch".to_owned()
+    };
+    match mode.as_str() {
+        "batch" => {
+            if RISING_KEYS.iter().any(|key| has_setting(ini, section, key)) {
+                return Err(ConfigError::new("DBX-RS-CFG-0055", "input.mode"));
+            }
+            Ok(CollectionMode::Batch)
+        }
+        "rising" => parse_rising_input(ini, section).map(CollectionMode::Rising),
+        _ => Err(ConfigError::new("DBX-RS-CFG-0054", "input.mode")),
+    }
+}
+
+fn parse_rising_input(ini: &Ini, section: &str) -> Result<RisingInputConfig, ConfigError> {
+    let input_id = parse_rising_input_id(
+        &required(ini, section, "input_id")
+            .map_err(|_| ConfigError::new("DBX-RS-CFG-0056", "input.input_id"))?,
+    )
+    .ok_or_else(|| ConfigError::new("DBX-RS-CFG-0056", "input.input_id"))?;
+    let timestamp_field = required(ini, section, "cursor_timestamp_field")
+        .map_err(|_| ConfigError::new("DBX-RS-CFG-0057", "input.cursor_timestamp_field"))?;
+    validate_cursor_field(
+        &timestamp_field,
+        "DBX-RS-CFG-0057",
+        "input.cursor_timestamp_field",
+    )?;
+    let id_field = required(ini, section, "cursor_id_field")
+        .map_err(|_| ConfigError::new("DBX-RS-CFG-0058", "input.cursor_id_field"))?;
+    validate_cursor_field(&id_field, "DBX-RS-CFG-0058", "input.cursor_id_field")?;
+    if timestamp_field == id_field {
+        return Err(ConfigError::new("DBX-RS-CFG-0058", "input.cursor_id_field"));
+    }
+
+    let overlap_secs = if has_setting(ini, section, "cursor_overlap_secs") {
+        required(ini, section, "cursor_overlap_secs")
+            .map_err(|_| ConfigError::new("DBX-RS-CFG-0059", "input.cursor_overlap_secs"))?
+            .parse::<u64>()
+            .map_err(|_| ConfigError::new("DBX-RS-CFG-0059", "input.cursor_overlap_secs"))?
+    } else {
+        0
+    };
+    if overlap_secs > HARD_INTERVAL_SECONDS {
+        return Err(ConfigError::new(
+            "DBX-RS-CFG-0059",
+            "input.cursor_overlap_secs",
+        ));
+    }
+
+    Ok(RisingInputConfig {
+        input_id,
+        timestamp_field,
+        id_field,
+        overlap: Duration::from_secs(overlap_secs),
+    })
+}
+
+fn has_setting(ini: &Ini, section: &str, key: &str) -> bool {
+    ini.get_map_ref()
+        .get(section)
+        .is_some_and(|values| values.contains_key(key))
+}
+
+fn validate_cursor_field(
+    value: &str,
+    code: &'static str,
+    field: &'static str,
+) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > MAX_POSTGRES_IDENTIFIER_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ConfigError::new(code, field));
+    }
+    Ok(())
+}
+
+fn parse_rising_input_id(value: &str) -> Option<RisingInputId> {
+    if value.len() != 36 {
+        return None;
+    }
+
+    let mut bytes = [0_u8; 16];
+    let mut byte_index = 0_usize;
+    let mut high_nibble = None;
+    for (index, byte) in value.bytes().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if byte != b'-' {
+                return None;
+            }
+            continue;
+        }
+        let nibble = lowercase_hex_nibble(byte)?;
+        if let Some(high) = high_nibble.take() {
+            let output = bytes.get_mut(byte_index)?;
+            *output = (high << 4) | nibble;
+            byte_index += 1;
+        } else {
+            high_nibble = Some(nibble);
+        }
+    }
+    if byte_index != bytes.len() || high_nibble.is_some() || bytes.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    Some(RisingInputId(bytes))
+}
+
+const fn lowercase_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn parse_query_source(
@@ -966,6 +1151,13 @@ source = dbx_rs:heartbeat
 "
     }
 
+    fn rising_input_config() -> String {
+        input_config().replace(
+            "disabled = false",
+            "disabled = false\nmode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\ncursor_timestamp_field = updated_at\ncursor_id_field = id",
+        )
+    }
+
     #[test]
     fn loads_typed_defaults_and_local_override() {
         let (root, app) = fixture();
@@ -977,6 +1169,7 @@ source = dbx_rs:heartbeat
 
         let effective = load_effective_config(&app, &root).expect("config must load");
         assert_eq!(effective.inputs.len(), 1);
+        assert_eq!(effective.inputs[0].mode, CollectionMode::Batch);
         assert_eq!(effective.inputs[0].connector, "postgres");
         assert!(matches!(&effective.inputs[0].query, QuerySource::File(_)));
         assert_eq!(
@@ -993,6 +1186,270 @@ source = dbx_rs:heartbeat
             4
         );
         fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn explicit_and_implicit_batch_modes_are_identical() {
+        let (root, app) = fixture();
+        let implicit = load_effective_config(&app, &root)
+            .expect("mode-less batch must load")
+            .inputs
+            .remove(0);
+        fs::write(
+            app.join("default").join(INPUTS_FILE),
+            input_config().replace("disabled = false", "disabled = false\nmode = batch"),
+        )
+        .expect("explicit batch fixture must be written");
+
+        let explicit = load_effective_config(&app, &root)
+            .expect("explicit batch must load")
+            .inputs
+            .remove(0);
+
+        assert_eq!(implicit, explicit);
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_empty_and_unknown_collection_modes() {
+        for mode in ["", "snapshot"] {
+            let (root, app) = fixture();
+            let configured = input_config().replace(
+                "disabled = false",
+                &format!("disabled = false\nmode = {mode}"),
+            );
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .expect("invalid mode fixture must be written");
+
+            let error = load_effective_config(&app, &root)
+                .expect_err("empty or unknown collection mode must fail");
+
+            assert_eq!(error.code(), "DBX-RS-CFG-0054");
+            assert_eq!(error.field(), "input.mode");
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+    }
+
+    #[test]
+    fn loads_structured_rising_mode_with_zero_overlap_default() {
+        let (root, app) = fixture();
+        fs::write(app.join("default").join(INPUTS_FILE), rising_input_config())
+            .expect("rising fixture must be written");
+
+        let effective = load_effective_config(&app, &root).expect("rising input must load");
+        let CollectionMode::Rising(rising) = &effective.inputs[0].mode else {
+            panic!("input must be rising");
+        };
+
+        assert_eq!(
+            rising.input_id.into_bytes(),
+            [
+                0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+                0x40, 0x00,
+            ]
+        );
+        assert_eq!(rising.timestamp_field, "updated_at");
+        assert_eq!(rising.id_field, "id");
+        assert_eq!(rising.overlap, Duration::ZERO);
+        let debug = format!("{rising:?}");
+        assert!(!debug.contains("123e4567"));
+        assert!(!debug.contains("updated_at"));
+        assert!(debug.contains("[REDACTED]"));
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn batch_mode_rejects_every_rising_only_setting() {
+        for setting in [
+            "input_id = 123e4567-e89b-12d3-a456-426614174000",
+            "cursor_timestamp_field = updated_at",
+            "cursor_id_field = id",
+            "cursor_overlap_secs = 0",
+        ] {
+            let (root, app) = fixture();
+            let configured =
+                input_config().replace("disabled = false", &format!("disabled = false\n{setting}"));
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .expect("batch fixture must be written");
+
+            let error = load_effective_config(&app, &root)
+                .expect_err("batch rising-only setting must fail");
+
+            assert_eq!(error.code(), "DBX-RS-CFG-0055");
+            assert_eq!(error.field(), "input.mode");
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+    }
+
+    #[test]
+    fn rising_mode_requires_identity_and_both_cursor_fields() {
+        for (line, code, field) in [
+            (
+                "input_id = 123e4567-e89b-12d3-a456-426614174000\n",
+                "DBX-RS-CFG-0056",
+                "input.input_id",
+            ),
+            (
+                "cursor_timestamp_field = updated_at\n",
+                "DBX-RS-CFG-0057",
+                "input.cursor_timestamp_field",
+            ),
+            (
+                "cursor_id_field = id\n",
+                "DBX-RS-CFG-0058",
+                "input.cursor_id_field",
+            ),
+        ] {
+            let (root, app) = fixture();
+            let configured = rising_input_config().replace(line, "");
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .expect("incomplete rising fixture must be written");
+
+            let error =
+                load_effective_config(&app, &root).expect_err("incomplete rising input must fail");
+
+            assert_eq!(error.code(), code);
+            assert_eq!(error.field(), field);
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+    }
+
+    #[test]
+    fn rising_identity_is_canonical_non_nil_and_unique_even_when_disabled() {
+        for invalid in [
+            "00000000-0000-0000-0000-000000000000",
+            "123E4567-E89B-12D3-A456-426614174000",
+            "123e4567e89b12d3a456426614174000",
+            "123e4567-e89b-12d3-a456-42661417400g",
+        ] {
+            let (root, app) = fixture();
+            let configured =
+                rising_input_config().replace("123e4567-e89b-12d3-a456-426614174000", invalid);
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .expect("invalid UUID fixture must be written");
+
+            let error =
+                load_effective_config(&app, &root).expect_err("invalid rising UUID must fail");
+
+            assert_eq!(error.code(), "DBX-RS-CFG-0056");
+            assert_eq!(error.field(), "input.input_id");
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+
+        let (root, app) = fixture();
+        let first = rising_input_config();
+        let second = first
+            .replace("[heartbeat]", "[disabled_copy]")
+            .replace("disabled = false", "disabled = true");
+        fs::write(
+            app.join("default").join(INPUTS_FILE),
+            format!("{first}\n{second}"),
+        )
+        .expect("duplicate identity fixture must be written");
+
+        let error =
+            load_effective_config(&app, &root).expect_err("duplicate rising identity must fail");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0060");
+        assert_eq!(error.field(), "input.input_id");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rising_cursor_aliases_are_exact_bounded_and_distinct() {
+        for (field, original, invalid, code, error_field) in [
+            (
+                "timestamp",
+                "cursor_timestamp_field = updated_at",
+                "cursor_timestamp_field = ".to_owned(),
+                "DBX-RS-CFG-0057",
+                "input.cursor_timestamp_field",
+            ),
+            (
+                "timestamp",
+                "cursor_timestamp_field = updated_at",
+                format!("cursor_timestamp_field = {}", "a".repeat(64)),
+                "DBX-RS-CFG-0057",
+                "input.cursor_timestamp_field",
+            ),
+            (
+                "identifier",
+                "cursor_id_field = id",
+                "cursor_id_field = invalid\u{7f}alias".to_owned(),
+                "DBX-RS-CFG-0058",
+                "input.cursor_id_field",
+            ),
+            (
+                "identifier",
+                "cursor_id_field = id",
+                "cursor_id_field = updated_at".to_owned(),
+                "DBX-RS-CFG-0058",
+                "input.cursor_id_field",
+            ),
+        ] {
+            let (root, app) = fixture();
+            let configured = rising_input_config().replace(original, &invalid);
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .unwrap_or_else(|_| panic!("{field} fixture must be written"));
+
+            let error =
+                load_effective_config(&app, &root).expect_err("invalid cursor alias must fail");
+
+            assert_eq!(error.code(), code);
+            assert_eq!(error.field(), error_field);
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+
+        let (root, app) = fixture();
+        let maximum = "a".repeat(MAX_POSTGRES_IDENTIFIER_BYTES);
+        let configured = rising_input_config().replace(
+            "cursor_timestamp_field = updated_at",
+            &format!("cursor_timestamp_field = {maximum}"),
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), configured)
+            .expect("maximum alias fixture must be written");
+        let effective = load_effective_config(&app, &root).expect("maximum alias must load");
+        let CollectionMode::Rising(rising) = &effective.inputs[0].mode else {
+            panic!("input must be rising");
+        };
+        assert_eq!(rising.timestamp_field, maximum);
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rising_overlap_accepts_its_closed_range() {
+        for (value, expected) in [("0", 0), ("31536000", HARD_INTERVAL_SECONDS)] {
+            let (root, app) = fixture();
+            let configured = rising_input_config().replace(
+                "cursor_id_field = id",
+                &format!("cursor_id_field = id\ncursor_overlap_secs = {value}"),
+            );
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .expect("overlap fixture must be written");
+
+            let effective = load_effective_config(&app, &root).expect("bounded overlap must load");
+            let CollectionMode::Rising(rising) = &effective.inputs[0].mode else {
+                panic!("input must be rising");
+            };
+            assert_eq!(rising.overlap, Duration::from_secs(expected));
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+
+        for invalid in ["31536001", "-1", "not-a-number"] {
+            let (root, app) = fixture();
+            let configured = rising_input_config().replace(
+                "cursor_id_field = id",
+                &format!("cursor_id_field = id\ncursor_overlap_secs = {invalid}"),
+            );
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .expect("invalid overlap fixture must be written");
+
+            let error =
+                load_effective_config(&app, &root).expect_err("invalid rising overlap must fail");
+            assert_eq!(error.code(), "DBX-RS-CFG-0059");
+            assert_eq!(error.field(), "input.cursor_overlap_secs");
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
     }
 
     #[test]

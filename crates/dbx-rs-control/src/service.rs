@@ -4,14 +4,14 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use dbx_rs_config::{
-    EffectiveConfig, InputConfig, MAX_QUERY_BYTES, MAX_TLS_CA_BYTES, QuerySource,
+    CollectionMode, EffectiveConfig, InputConfig, MAX_QUERY_BYTES, MAX_TLS_CA_BYTES, QuerySource,
     load_effective_config,
 };
 use dbx_rs_connector_sdk::{
-    ConnectionConfig, ProbeRequest, QueryText, TlsMode, ValidationIssue, ValidationRequest,
-    ValidationSeverity,
+    ConnectionConfig, CursorNullPolicy, ProbeRequest, QueryText, TimestampIdCursorSpec, TlsMode,
+    ValidationIssue, ValidationRequest, ValidationSeverity,
 };
-use dbx_rs_native_connectors::{JsonCollectionRequest, NativeConnectorProvider};
+use dbx_rs_native_connectors::{JsonCollectionRequest, JsonRow, NativeConnectorProvider};
 use dbx_rs_secure_store::{SecretStore, read_limited};
 use dbx_rs_telemetry::{
     NdjsonTelemetry, OperationContext, OperationFailure, OperationLimits, OperationMetrics,
@@ -224,6 +224,15 @@ impl ControlService {
     ) -> InputValidationResponse {
         let mut issues = Vec::new();
         let query = load_configured_query(input);
+        let cursor = match &input.mode {
+            CollectionMode::Batch => None,
+            CollectionMode::Rising(rising) => Some(TimestampIdCursorSpec {
+                timestamp_field: rising.timestamp_field.clone(),
+                id_field: rising.id_field.clone(),
+                overlap: rising.overlap,
+                null_policy: CursorNullPolicy::Reject,
+            }),
+        };
         match Self::connection_config(input) {
             Ok(connection) => match self.connectors.validate(&ValidationRequest {
                 connection,
@@ -232,6 +241,7 @@ impl ControlService {
                     .ok()
                     .map(|query| QueryText::new(query.clone())),
                 max_rows: Some(input.max_rows),
+                cursor,
             }) {
                 Ok(report) => issues.extend(report.issues),
                 Err(error) => {
@@ -333,7 +343,7 @@ impl ControlService {
         let (line_tx, line_rx) = mpsc::channel(ROW_CHANNEL_CAPACITY);
         let collect =
             self.connectors
-                .collect_json_lines(connector_request, &secret, line_tx, cancellation);
+                .collect_json_rows(connector_request, &secret, line_tx, cancellation);
         let receive = receive_rows(line_rx, limits.max_rows, limits.max_bytes);
         let (collection, rows) = tokio::join!(collect, receive);
         let rows = rows?;
@@ -609,7 +619,7 @@ fn resolve_limit(value: Option<u64>, cap: u64, field: &str) -> Result<u64, Contr
 }
 
 async fn receive_rows(
-    mut receiver: mpsc::Receiver<Vec<u8>>,
+    mut receiver: mpsc::Receiver<JsonRow>,
     max_rows: u64,
     max_bytes: u64,
 ) -> Result<ReceivedRows, ControlError> {
@@ -626,6 +636,7 @@ async fn receive_rows(
     let mut rows = Vec::with_capacity(capacity);
     let mut bytes_read = 0_u64;
     while let Some(line) = receiver.recv().await {
+        let (line, _cursor) = line.into_parts();
         if rows.len() >= capacity {
             return Err(ControlError::new(
                 "DBX-RS-CONTROL-0012",
@@ -832,6 +843,7 @@ mod tests {
         InputConfig {
             name: "warehouse".into(),
             disabled: false,
+            mode: dbx_rs_config::CollectionMode::Batch,
             connector: "postgres".into(),
             interval: Duration::from_mins(1),
             host: "database.example".into(),
@@ -886,8 +898,14 @@ mod tests {
     #[tokio::test]
     async fn response_receiver_enforces_row_limit_independently() {
         let (sender, receiver) = mpsc::channel(2);
-        sender.send(b"{\"row\":1}".to_vec()).await.expect("send");
-        sender.send(b"{\"row\":2}".to_vec()).await.expect("send");
+        sender
+            .send(JsonRow::new(b"{\"row\":1}".to_vec(), None))
+            .await
+            .expect("send");
+        sender
+            .send(JsonRow::new(b"{\"row\":2}".to_vec(), None))
+            .await
+            .expect("send");
         drop(sender);
 
         let error = receive_rows(receiver, 1, 1_024)
@@ -901,7 +919,10 @@ mod tests {
     #[tokio::test]
     async fn response_receiver_enforces_byte_limit_independently() {
         let (sender, receiver) = mpsc::channel(1);
-        sender.send(b"{}".to_vec()).await.expect("send");
+        sender
+            .send(JsonRow::new(b"{}".to_vec(), None))
+            .await
+            .expect("send");
         drop(sender);
 
         let error = receive_rows(receiver, 1, 2)

@@ -137,24 +137,24 @@ impl NativeConnectorProvider {
     /// schema or counter mismatches, lossy conversion, output-limit violations, or a closed output
     /// channel. A materialization or output error takes precedence over the secondary error caused
     /// when the connector observes the closed IPC receiver.
-    pub async fn collect_json_lines(
+    pub async fn collect_json_rows(
         &self,
         request: JsonCollectionRequest,
         secret: &ResolvedSecret,
-        line_tx: mpsc::Sender<Vec<u8>>,
+        row_tx: mpsc::Sender<JsonRow>,
         cancellation: CancellationToken,
     ) -> Result<CollectionResult, ConnectorError> {
         validate_collection_request(&request)?;
         let connector = self.connector(&request.connection.connector_id)?;
-        collect_json_lines_with_connector(connector, request, secret, line_tx, cancellation).await
+        collect_json_rows_with_connector(connector, request, secret, row_tx, cancellation).await
     }
 }
 
-async fn collect_json_lines_with_connector(
+async fn collect_json_rows_with_connector(
     connector: Arc<dyn Connector>,
     request: JsonCollectionRequest,
     secret: &ResolvedSecret,
-    line_tx: mpsc::Sender<Vec<u8>>,
+    row_tx: mpsc::Sender<JsonRow>,
     cancellation: CancellationToken,
 ) -> Result<CollectionResult, ConnectorError> {
     let operation_cancellation = cancellation.child_token();
@@ -164,11 +164,11 @@ async fn collect_json_lines_with_connector(
             "collection timeout cannot be represented",
         )
     })?;
-    let operation = collect_json_lines_inner(
+    let operation = collect_json_rows_inner(
         connector,
         request,
         secret,
-        line_tx,
+        row_tx,
         deadline,
         operation_cancellation.clone(),
     );
@@ -192,11 +192,11 @@ async fn collect_json_lines_with_connector(
     }
 }
 
-async fn collect_json_lines_inner(
+async fn collect_json_rows_inner(
     connector: Arc<dyn Connector>,
     request: JsonCollectionRequest,
     secret: &ResolvedSecret,
-    line_tx: mpsc::Sender<Vec<u8>>,
+    row_tx: mpsc::Sender<JsonRow>,
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<CollectionResult, ConnectorError> {
@@ -235,7 +235,7 @@ async fn collect_json_lines_inner(
     );
     let materialize = materialize_batches(
         batch_rx,
-        line_tx,
+        row_tx,
         MaterializationOptions {
             request_id: request.request_id.clone(),
             expected_schema: prepared.schema,
@@ -314,6 +314,45 @@ pub struct JsonCollectionRequest {
     pub timeout: Duration,
     #[serde(default)]
     pub cursor: Option<TimestampIdCursorRequest>,
+}
+
+/// One materialized NDJSON row and its validated connector-neutral cursor tuple, when configured.
+#[derive(Clone, Eq, PartialEq)]
+pub struct JsonRow {
+    bytes: Vec<u8>,
+    cursor: Option<TimestampIdCursor>,
+}
+
+impl JsonRow {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>, cursor: Option<TimestampIdCursor>) -> Self {
+        Self { bytes, cursor }
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Option<TimestampIdCursor>) {
+        (self.bytes, self.cursor)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub const fn cursor(&self) -> Option<TimestampIdCursor> {
+        self.cursor
+    }
+}
+
+impl std::fmt::Debug for JsonRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JsonRow")
+            .field("bytes", &"[REDACTED]")
+            .field("cursor", &self.cursor.as_ref().map(|_| "[CONFIGURED]"))
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for JsonCollectionRequest {
@@ -498,7 +537,7 @@ struct MaterializationOptions {
 
 async fn materialize_batches(
     mut batch_rx: mpsc::Receiver<ArrowIpcBatch>,
-    line_tx: mpsc::Sender<Vec<u8>>,
+    row_tx: mpsc::Sender<JsonRow>,
     options: MaterializationOptions,
 ) -> Result<MaterializedResult, ConnectorError> {
     let MaterializationOptions {
@@ -526,7 +565,7 @@ async fn materialize_batches(
         expected_schema: &expected_schema,
         limits,
         max_output_bytes,
-        line_tx: &line_tx,
+        row_tx: &row_tx,
         cancellation: &cancellation,
     };
 
@@ -568,7 +607,7 @@ struct MaterializationContext<'a> {
     expected_schema: &'a QuerySchema,
     limits: ExecutionLimits,
     max_output_bytes: u64,
-    line_tx: &'a mpsc::Sender<Vec<u8>>,
+    row_tx: &'a mpsc::Sender<JsonRow>,
     cancellation: &'a CancellationToken,
 }
 
@@ -637,7 +676,7 @@ async fn materialize_envelope(
             .as_deref()
             .map(|tracker| tracker.validate_row(&decoded, row))
             .transpose()?;
-        materialize_and_send_row(&decoded, &envelope.schema, row, result, context).await?;
+        materialize_and_send_row(&decoded, &envelope.schema, row, cursor, result, context).await?;
         if let (Some(tracker), Some(cursor)) = (cursor_tracker.as_deref_mut(), cursor) {
             tracker.record_emitted(cursor);
         }
@@ -656,6 +695,7 @@ async fn materialize_and_send_row(
     batch: &RecordBatch,
     schema: &QuerySchema,
     row: usize,
+    cursor: Option<TimestampIdCursor>,
     result: &mut MaterializedResult,
     context: &MaterializationContext<'_>,
 ) -> Result<(), ConnectorError> {
@@ -691,7 +731,7 @@ async fn materialize_and_send_row(
         () = context.cancellation.cancelled() => {
             return Err(ConnectorError::cancelled("DBX-RS-NATIVE-CANCELLED-0002"));
         }
-        send = context.line_tx.send(line) => {
+        send = context.row_tx.send(JsonRow::new(line, cursor)) => {
             send.map_err(|_| {
                 error(
                     "DBX-RS-NATIVE-OUTPUT-0001",
@@ -1923,7 +1963,10 @@ mod tests {
         .expect("batch must materialize");
         assert_eq!(result.rows, 1);
         assert_eq!(result.ndjson_bytes, 12);
-        assert_eq!(line_rx.recv().await, Some(br#"{"value":1}"#.to_vec()));
+        assert_eq!(
+            line_rx.recv().await.map(JsonRow::into_parts),
+            Some((br#"{"value":1}"#.to_vec(), None))
+        );
     }
 
     #[tokio::test]
@@ -1968,9 +2011,18 @@ mod tests {
             Some(TimestampIdCursor::new(11, -1))
         );
         assert_eq!(result.scan_resume, Some(TimestampIdCursor::new(11, -1)));
-        assert!(line_rx.recv().await.is_some());
-        assert!(line_rx.recv().await.is_some());
-        assert!(line_rx.recv().await.is_some());
+        assert_eq!(
+            line_rx.recv().await.and_then(|row| row.cursor()),
+            Some(TimestampIdCursor::new(10, 2))
+        );
+        assert_eq!(
+            line_rx.recv().await.and_then(|row| row.cursor()),
+            Some(TimestampIdCursor::new(10, 3))
+        );
+        assert_eq!(
+            line_rx.recv().await.and_then(|row| row.cursor()),
+            Some(TimestampIdCursor::new(11, -1))
+        );
     }
 
     #[test]
@@ -2038,7 +2090,7 @@ mod tests {
         let request = collection_request(1, 1024, Duration::from_secs(50));
         let (line_tx, _line_rx) = mpsc::channel(1);
 
-        let error = collect_json_lines_with_connector(
+        let error = collect_json_rows_with_connector(
             connector.clone(),
             request,
             &ResolvedSecret::new(b"test-only".to_vec()),

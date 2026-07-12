@@ -1,5 +1,6 @@
 [example_postgres]
 disabled = true
+mode = batch
 connector = postgres
 interval_secs = 60
 host = database.example
@@ -19,3 +20,30 @@ max_bytes = 1048576
 index = dbx_rs_test
 sourcetype = dbx_rs:postgres:row
 source = dbx_rs:example_postgres
+
+[example_postgres_rising]
+disabled = true
+mode = rising
+input_id = 7f4e0c52-4d73-4bf8-9a48-57e8801d16af
+cursor_timestamp_field = dbx_cursor_time
+cursor_id_field = dbx_cursor_id
+cursor_overlap_secs = 30
+connector = postgres
+interval_secs = 60
+host = database.example
+port = 5432
+database = events
+username = dbx_reader
+secret_ref = local:example_postgres_rising
+tls_mode = verify-full
+tls_server_name = database.example
+tls_ca_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/certs/psql/database-ca.pem
+query = SELECT occurred_at AS dbx_cursor_time, event_id AS dbx_cursor_id, payload FROM public.events
+connect_timeout_secs = 10
+probe_timeout_secs = 10
+query_timeout_secs = 30
+max_rows = 1000
+max_bytes = 1048576
+index = dbx_rs_test
+sourcetype = dbx_rs:postgres:row
+source = dbx_rs:example_postgres_rising

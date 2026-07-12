@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dbx_rs_secure_store::ensure_private_dir;
+use ring::digest::{Context, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::error::SpoolError;
-use crate::format::{SegmentDecoder, SegmentEncoder};
+use crate::format::{FORMAT_VERSION, SegmentDecoder, SegmentEncoder};
 use crate::identity::{InputKey, SegmentId, decode_hex, encode_hex};
 use crate::key::SpoolKey;
-use crate::model::{SegmentHeader, SegmentSummary, SpoolLimits, SpoolUsage};
+use crate::model::{RecoveryMetadata, SegmentHeader, SegmentSummary, SpoolLimits, SpoolUsage};
 
 const SEGMENTS_DIRECTORY: &str = "segments";
 const QUARANTINE_DIRECTORY: &str = "quarantine";
@@ -19,6 +20,7 @@ const READY_EXTENSION: &str = "ready";
 const DELIVERED_EXTENSION: &str = "delivered";
 const QUARANTINE_EXTENSION: &str = "quarantine";
 const SEGMENT_ID_ATTEMPTS: usize = 16;
+const REFERENCE_DIGEST_DOMAIN: &[u8] = b"dbx-rs/spool-segment-reference/v1\0";
 
 #[derive(Clone)]
 pub struct Spool {
@@ -146,12 +148,16 @@ impl Spool {
         self.validate_owned_path(&segment.path, READY_EXTENSION)?;
         let file = open_private_file(&segment.path)?;
         let decoder = SegmentDecoder::open(file, &self.inner.key, self.inner.limits.segment)?;
-        if decoder.segment_id() != segment.segment_id || decoder.header != segment.header {
+        if decoder.segment_id() != segment.segment_id
+            || decoder.header != segment.header
+            || decoder.format_version() != segment.format_version
+        {
             return Err(identity_mismatch());
         }
         Ok(SegmentReader {
             decoder,
             expected_summary: segment.summary,
+            expected_recovery_metadata: segment.recovery_metadata.clone(),
             terminal_error: false,
         })
     }
@@ -189,6 +195,8 @@ impl Spool {
             header: segment.header,
             segment_id: segment.segment_id,
             summary: segment.summary,
+            format_version: segment.format_version,
+            recovery_metadata: segment.recovery_metadata.clone(),
             byte_len: segment.byte_len,
         })
     }
@@ -435,6 +443,8 @@ impl Spool {
                     header: inspected.header,
                     segment_id,
                     summary: inspected.summary,
+                    format_version: inspected.format_version,
+                    recovery_metadata: inspected.recovery_metadata,
                     byte_len: inspected.byte_len,
                 });
             }
@@ -464,6 +474,8 @@ impl Spool {
         if inspected.header != segment.header
             || inspected.segment_id != segment.segment_id
             || inspected.summary != segment.summary
+            || inspected.format_version != segment.format_version
+            || inspected.recovery_metadata != segment.recovery_metadata
             || inspected.byte_len != segment.byte_len
         {
             return Err(identity_mismatch());
@@ -477,6 +489,8 @@ impl Spool {
         if inspected.header != segment.header
             || inspected.segment_id != segment.segment_id
             || inspected.summary != segment.summary
+            || inspected.format_version != segment.format_version
+            || inspected.recovery_metadata != segment.recovery_metadata
             || inspected.byte_len != segment.byte_len
         {
             return Err(identity_mismatch());
@@ -528,9 +542,24 @@ impl SegmentWriter {
     /// Returns an error if footer creation, synchronization, publication, parent synchronization,
     /// or accounting fails. A successfully renamed ready segment is never deleted on a later
     /// synchronization error and will be recovered by inventory scanning.
-    pub fn seal(mut self) -> Result<ReadySegment, SpoolError> {
+    pub fn seal(self) -> Result<ReadySegment, SpoolError> {
+        self.seal_with_recovery_metadata(RecoveryMetadata::empty())
+    }
+
+    /// Seals the segment with one bounded, authenticated opaque recovery value.
+    ///
+    /// The metadata frame is written after every event and immediately before the footer. The
+    /// encoder reserves enough space for the maximum metadata value before accepting any event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::seal`].
+    pub fn seal_with_recovery_metadata(
+        mut self,
+        recovery_metadata: RecoveryMetadata,
+    ) -> Result<ReadySegment, SpoolError> {
         let encoder = self.encoder.take().ok_or_else(writer_closed)?;
-        let (file, summary, byte_len) = encoder.finish()?;
+        let (file, summary, byte_len) = encoder.finish(&recovery_metadata)?;
         drop(file);
         let ready_path = self.open_path.with_extension(READY_EXTENSION);
         if ready_path.exists() {
@@ -567,6 +596,8 @@ impl SegmentWriter {
             header: self.header,
             segment_id: self.segment_id,
             summary,
+            format_version: FORMAT_VERSION,
+            recovery_metadata,
             byte_len,
         })
     }
@@ -621,6 +652,8 @@ pub struct ReadySegment {
     header: SegmentHeader,
     segment_id: SegmentId,
     summary: SegmentSummary,
+    format_version: u16,
+    recovery_metadata: RecoveryMetadata,
     byte_len: u64,
 }
 
@@ -638,6 +671,23 @@ impl ReadySegment {
     #[must_use]
     pub const fn summary(&self) -> SegmentSummary {
         self.summary
+    }
+
+    #[must_use]
+    pub fn recovery_metadata(&self) -> &RecoveryMetadata {
+        &self.recovery_metadata
+    }
+
+    /// Returns the state-reference digest for the complete authenticated segment identity.
+    #[must_use]
+    pub fn reference_digest(&self) -> [u8; 32] {
+        segment_reference_digest(
+            self.format_version,
+            self.segment_id,
+            &self.header,
+            self.summary,
+            &self.recovery_metadata,
+        )
     }
 
     #[must_use]
@@ -664,6 +714,8 @@ pub struct DeliveredSegment {
     header: SegmentHeader,
     segment_id: SegmentId,
     summary: SegmentSummary,
+    format_version: u16,
+    recovery_metadata: RecoveryMetadata,
     byte_len: u64,
 }
 
@@ -684,6 +736,23 @@ impl DeliveredSegment {
     }
 
     #[must_use]
+    pub fn recovery_metadata(&self) -> &RecoveryMetadata {
+        &self.recovery_metadata
+    }
+
+    /// Returns the same state-reference digest exposed by the corresponding ready segment.
+    #[must_use]
+    pub fn reference_digest(&self) -> [u8; 32] {
+        segment_reference_digest(
+            self.format_version,
+            self.segment_id,
+            &self.header,
+            self.summary,
+            &self.recovery_metadata,
+        )
+    }
+
+    #[must_use]
     pub const fn byte_len(&self) -> u64 {
         self.byte_len
     }
@@ -694,6 +763,8 @@ impl DeliveredSegment {
             header: segment.header,
             segment_id: segment.segment_id,
             summary: segment.summary,
+            format_version: segment.format_version,
+            recovery_metadata: segment.recovery_metadata,
             byte_len: segment.byte_len,
         }
     }
@@ -704,6 +775,8 @@ impl DeliveredSegment {
             header: self.header,
             segment_id: self.segment_id,
             summary: self.summary,
+            format_version: self.format_version,
+            recovery_metadata: self.recovery_metadata.clone(),
             byte_len: self.byte_len,
         }
     }
@@ -724,6 +797,7 @@ impl std::fmt::Debug for DeliveredSegment {
 pub struct SegmentReader {
     decoder: SegmentDecoder,
     expected_summary: SegmentSummary,
+    expected_recovery_metadata: RecoveryMetadata,
     terminal_error: bool,
 }
 
@@ -737,7 +811,9 @@ impl Iterator for SegmentReader {
         match self.decoder.next_event() {
             Ok(Some(event)) => Some(Ok(event)),
             Ok(None) => {
-                if self.decoder.summary() == Some(self.expected_summary) {
+                if self.decoder.summary() == Some(self.expected_summary)
+                    && self.decoder.recovery_metadata() == Some(&self.expected_recovery_metadata)
+                {
                     None
                 } else {
                     self.terminal_error = true;
@@ -760,6 +836,8 @@ struct InspectedSegment {
     header: SegmentHeader,
     segment_id: SegmentId,
     summary: SegmentSummary,
+    format_version: u16,
+    recovery_metadata: RecoveryMetadata,
     byte_len: u64,
 }
 
@@ -789,10 +867,19 @@ fn inspect_segment(
             "spool segment has no authenticated footer",
         )
     })?;
+    let recovery_metadata = decoder.recovery_metadata().cloned().ok_or_else(|| {
+        SpoolError::new(
+            "DBX-RS-SPOOL-FORMAT-0025",
+            "recovery_metadata",
+            "spool segment has no recovery metadata",
+        )
+    })?;
     Ok(InspectedSegment {
         header: decoder.header,
         segment_id: decoder.segment_id(),
         summary,
+        format_version: decoder.format_version(),
+        recovery_metadata,
         byte_len,
     })
 }
@@ -908,6 +995,34 @@ fn decrement_entry(values: &mut BTreeMap<InputKey, u64>, key: InputKey, bytes: u
             values.remove(&key);
         }
     }
+}
+
+fn segment_reference_digest(
+    format_version: u16,
+    segment_id: SegmentId,
+    header: &SegmentHeader,
+    summary: SegmentSummary,
+    recovery_metadata: &RecoveryMetadata,
+) -> [u8; 32] {
+    let mut context = Context::new(&SHA256);
+    context.update(REFERENCE_DIGEST_DOMAIN);
+    context.update(&format_version.to_be_bytes());
+    context.update(segment_id.as_bytes());
+    context.update(header.input_key.as_bytes());
+    context.update(header.configuration_fingerprint.as_bytes());
+    context.update(&header.configuration_generation.to_be_bytes());
+    context.update(header.batch_id.as_bytes());
+    context.update(&header.batch_sequence.to_be_bytes());
+    context.update(&header.segment_sequence.to_be_bytes());
+    context.update(&header.created_epoch_millis.to_be_bytes());
+    context.update(&summary.event_count.to_be_bytes());
+    context.update(&summary.plaintext_bytes.to_be_bytes());
+    context.update(&summary.stream_digest);
+    context.update(&(recovery_metadata.as_bytes().len() as u64).to_be_bytes());
+    context.update(recovery_metadata.as_bytes());
+    let mut digest = [0_u8; 32];
+    digest.copy_from_slice(context.finish().as_ref());
+    digest
 }
 
 fn sort_key(segment: &ReadySegment) -> (InputKey, u64, crate::BatchId, u64, SegmentId) {

@@ -9,7 +9,7 @@ use dbx_rs_secure_store::{SecureStoreError, atomic_write, ensure_private_dir, re
 use ring::digest::{Context, SHA256};
 
 use crate::model::{
-    ActiveScan, DurableInputState, Fingerprint, StateKey, StateValidationError,
+    ActiveScan, DurableInputState, Fingerprint, InputId, StateKey, StateValidationError,
     configuration_fence_id,
 };
 
@@ -131,6 +131,48 @@ impl FileCheckpointStore {
         self.load_unlocked(key)
     }
 
+    /// Inventories every persisted input identity without creating state directories.
+    ///
+    /// Each input directory and current envelope is validated exactly as it is during a keyed
+    /// load. Unknown entries, missing current envelopes, and directory/key mismatches fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths, malformed inventory, or an invalid checkpoint envelope.
+    pub fn input_ids(&self) -> Result<Vec<InputId>, StateStoreError> {
+        let _guard = self
+            .writer
+            .lock()
+            .map_err(|_| StateStoreError::LockPoisoned)?;
+        validate_directory_if_exists(&self.root)?;
+        let inputs = self.root.join("inputs");
+        validate_directory_if_exists(&inputs)?;
+        let entries = match fs::read_dir(&inputs) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(StateStoreError::Filesystem),
+        };
+        let mut identities = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| StateStoreError::Filesystem)?;
+            let path = entry.path();
+            validate_directory_if_exists(&path)?;
+            let directory_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StateStoreError::InvalidPathType)?;
+            let (_bytes, stored) =
+                read_envelope(&path.join(CURRENT_FILE))?.ok_or(StateStoreError::MissingCurrent)?;
+            let key = StateKey::for_input(stored.value.input_id);
+            if directory_name != key.directory_name() {
+                return Err(StateStoreError::StateKeyMismatch);
+            }
+            identities.push(stored.value.input_id);
+        }
+        identities.sort_unstable_by_key(|identity| identity.into_bytes());
+        Ok(identities)
+    }
+
     /// Creates revision one for a previously missing input.
     ///
     /// # Errors
@@ -196,9 +238,9 @@ impl FileCheckpointStore {
 
     /// Activates a new non-lineage configuration fingerprint at the next durable generation.
     ///
-    /// Query and cursor identity are deliberately preserved by this API. Changing either identity
-    /// requires a separate administrative migration policy that this store does not infer. The
-    /// caller must first stop the input and reconcile every retained spool segment for it.
+    /// Source-lineage and cursor identity are deliberately preserved by this API. Changing either
+    /// identity requires a separate administrative migration policy that this store does not infer.
+    /// The caller must first stop the input and reconcile every retained spool segment for it.
     ///
     /// # Errors
     ///
@@ -450,7 +492,7 @@ impl fmt::Display for StateStoreError {
             Self::RevisionOverflow => "checkpoint store revision is exhausted",
             Self::NoStateChange => "checkpoint state transition does not change durable state",
             Self::IdentityMigrationRequired => {
-                "query or cursor identity change requires explicit migration"
+                "source-lineage or cursor identity change requires explicit migration"
             }
             Self::ConfigurationActivationRequired => {
                 "configuration change requires explicit activation"
@@ -495,7 +537,7 @@ fn validate_transition(
     if current.input_id != next.input_id {
         return Err(StateStoreError::StateKeyMismatch);
     }
-    if current.query_fingerprint != next.query_fingerprint
+    if current.source_lineage_fingerprint != next.source_lineage_fingerprint
         || current.cursor_identity_fingerprint != next.cursor_identity_fingerprint
     {
         return Err(StateStoreError::IdentityMigrationRequired);
@@ -611,52 +653,97 @@ fn validate_scan_transition(
     transition: CheckpointTransition,
 ) -> Result<(), StateStoreError> {
     match transition {
-        CheckpointTransition::Unchanged => {
-            let active = current
-                .coordinator
-                .active_attempt
-                .as_ref()
-                .ok_or(StateStoreError::NoStateChange)?;
-            if active.collection != CollectionState::InProgress {
-                return Err(StateStoreError::InvalidCheckpointTransition);
+        CheckpointTransition::Unchanged => match (&current.active_scan, &next.active_scan) {
+            (Some(current_scan), Some(next_scan))
+                if current_scan.delivered_through_sequence
+                    != next_scan.delivered_through_sequence =>
+            {
+                validate_delivery_receipt_advance(current_scan, next_scan)
             }
-            match (&current.active_scan, &next.active_scan) {
-                (None, Some(scan)) => validate_initial_scan(scan),
-                (Some(current), Some(next)) => validate_scan_append(current, next, false),
-                (None, None) => Err(StateStoreError::NoStateChange),
-                (Some(_), None) => Err(StateStoreError::ScanProgressRegression),
+            (Some(current_scan), Some(next_scan))
+                if current_scan.compacted_through_sequence
+                    != next_scan.compacted_through_sequence
+                    || current_scan.compacted_rows != next_scan.compacted_rows =>
+            {
+                validate_scan_compaction(current_scan, next_scan)
             }
-        }
+            (None, Some(_)) => Err(StateStoreError::InvalidCheckpointTransition),
+            (Some(current_scan), Some(next_scan)) => {
+                let active = current
+                    .coordinator
+                    .active_attempt
+                    .as_ref()
+                    .ok_or(StateStoreError::NoStateChange)?;
+                if active.collection != CollectionState::InProgress {
+                    return Err(StateStoreError::InvalidCheckpointTransition);
+                }
+                validate_scan_append(current_scan, next_scan, false)
+            }
+            (None, None) => Err(StateStoreError::NoStateChange),
+            (Some(_), None) => Err(StateStoreError::ScanProgressRegression),
+        },
         CheckpointTransition::StartAttempt => {
             if current.active_scan.is_some() {
                 return Err(StateStoreError::ScanProgressRegression);
             }
             next.active_scan
                 .as_ref()
-                .map_or(Ok(()), validate_initial_scan)
+                .ok_or(StateStoreError::ScanProgressRegression)
+                .and_then(validate_initial_scan)
         }
         CheckpointTransition::CollectionCompleted => {
-            match (&current.active_scan, &next.active_scan) {
-                (None, None) => Ok(()),
-                (Some(current), Some(next)) => validate_scan_append(current, next, true),
-                (None, Some(_)) | (Some(_), None) => Err(StateStoreError::ScanProgressRegression),
-            }
+            let (Some(current_scan), Some(next_scan)) = (&current.active_scan, &next.active_scan)
+            else {
+                return Err(StateStoreError::ScanProgressRegression);
+            };
+            validate_scan_append(current_scan, next_scan, true)
         }
-        CheckpointTransition::CollectionFailed | CheckpointTransition::DeliveryChanged => {
-            if current.active_scan == next.active_scan {
-                Ok(())
-            } else {
-                Err(StateStoreError::ScanProgressRegression)
+        CheckpointTransition::CollectionFailed => match (&current.active_scan, &next.active_scan) {
+            (Some(current_scan), Some(next_scan)) if current_scan == next_scan => Ok(()),
+            _ => Err(StateStoreError::ScanProgressRegression),
+        },
+        CheckpointTransition::DeliveryChanged => {
+            let (Some(current_scan), Some(next_scan)) = (&current.active_scan, &next.active_scan)
+            else {
+                return Err(StateStoreError::ScanProgressRegression);
+            };
+            if current_scan != next_scan {
+                return Err(StateStoreError::ScanProgressRegression);
             }
+            let delivery = next
+                .coordinator
+                .active_attempt
+                .as_ref()
+                .ok_or(StateStoreError::InvalidCheckpointTransition)?
+                .delivery;
+            if matches!(delivery, DeliveryState::Confirmed { .. })
+                && !scan_has_full_delivery_receipt(next_scan)?
+            {
+                return Err(StateStoreError::ScanProgressRegression);
+            }
+            Ok(())
         }
         CheckpointTransition::Commit => {
-            if next.active_scan.is_none() {
-                Ok(())
-            } else {
-                Err(StateStoreError::ScanProgressRegression)
+            let scan = current
+                .active_scan
+                .as_ref()
+                .ok_or(StateStoreError::ScanProgressRegression)?;
+            if next.active_scan.is_some() || !scan_has_full_delivery_receipt(scan)? {
+                return Err(StateStoreError::ScanProgressRegression);
             }
+            Ok(())
         }
     }
+}
+
+fn scan_has_full_delivery_receipt(scan: &ActiveScan) -> Result<bool, StateStoreError> {
+    let retained_count =
+        u64::try_from(scan.segments.len()).map_err(|_| StateStoreError::ScanProgressRegression)?;
+    let segment_count = scan
+        .compacted_through_sequence
+        .checked_add(retained_count)
+        .ok_or(StateStoreError::ScanProgressRegression)?;
+    Ok(scan.complete && scan.delivered_through_sequence == segment_count)
 }
 
 fn validate_initial_scan(scan: &ActiveScan) -> Result<(), StateStoreError> {
@@ -665,6 +752,9 @@ fn validate_initial_scan(scan: &ActiveScan) -> Result<(), StateStoreError> {
         && scan.segments.is_empty()
         && scan.resume_after.is_none()
         && scan.maximum_candidate.is_none()
+        && scan.compacted_through_sequence == 0
+        && scan.compacted_rows == 0
+        && scan.delivered_through_sequence == 0
     {
         Ok(())
     } else {
@@ -681,33 +771,108 @@ fn validate_scan_append(
         || current.base_committed != next.base_committed
         || current.complete
         || next.complete != completes_collection
+        || current.compacted_through_sequence != next.compacted_through_sequence
+        || current.compacted_rows != next.compacted_rows
+        || current.delivered_through_sequence != next.delivered_through_sequence
         || next.next_page < current.next_page
         || !next.segments.starts_with(&current.segments)
     {
         return Err(StateStoreError::ScanProgressRegression);
     }
 
-    let appended = next.segments.len() > current.segments.len();
-    if !appended {
-        if next.next_page != current.next_page
-            || next.resume_after != current.resume_after
-            || next.maximum_candidate != current.maximum_candidate
-        {
-            return Err(StateStoreError::ScanProgressRegression);
+    match next.segments.len() - current.segments.len() {
+        0 => {
+            if next.next_page != current.next_page
+                || next.resume_after != current.resume_after
+                || next.maximum_candidate != current.maximum_candidate
+            {
+                return Err(StateStoreError::ScanProgressRegression);
+            }
+            if completes_collection {
+                Ok(())
+            } else {
+                Err(StateStoreError::NoStateChange)
+            }
         }
-        return if completes_collection {
+        1 => {
+            let expected_next_page = current
+                .next_page
+                .checked_add(1)
+                .ok_or(StateStoreError::ScanProgressRegression)?;
+            if next.next_page != expected_next_page
+                || !cursor_strictly_advances(current.resume_after, next.resume_after)
+                || cursor_regresses(current.maximum_candidate, next.maximum_candidate)
+            {
+                return Err(StateStoreError::ScanProgressRegression);
+            }
             Ok(())
-        } else {
-            Err(StateStoreError::NoStateChange)
-        };
+        }
+        _ => Err(StateStoreError::ScanProgressRegression),
+    }
+}
+
+fn validate_delivery_receipt_advance(
+    current: &ActiveScan,
+    next: &ActiveScan,
+) -> Result<(), StateStoreError> {
+    let expected_sequence = current
+        .delivered_through_sequence
+        .checked_add(1)
+        .ok_or(StateStoreError::ScanProgressRegression)?;
+    if next.delivered_through_sequence != expected_sequence {
+        return Err(StateStoreError::ScanProgressRegression);
+    }
+    let last_sequence = current.segments.last().map_or(
+        current.compacted_through_sequence,
+        crate::SegmentRef::sequence,
+    );
+    if next.delivered_through_sequence > last_sequence {
+        return Err(StateStoreError::ScanProgressRegression);
     }
 
-    if !cursor_strictly_advances(current.resume_after, next.resume_after)
-        || cursor_regresses(current.maximum_candidate, next.maximum_candidate)
+    let mut expected = current.clone();
+    expected.delivered_through_sequence = next.delivered_through_sequence;
+    if expected == *next {
+        Ok(())
+    } else {
+        Err(StateStoreError::ScanProgressRegression)
+    }
+}
+
+fn validate_scan_compaction(
+    current: &ActiveScan,
+    next: &ActiveScan,
+) -> Result<(), StateStoreError> {
+    if next.compacted_through_sequence <= current.compacted_through_sequence
+        || next.compacted_through_sequence > current.delivered_through_sequence
     {
         return Err(StateStoreError::ScanProgressRegression);
     }
-    Ok(())
+    let removed_count = next
+        .compacted_through_sequence
+        .checked_sub(current.compacted_through_sequence)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or(StateStoreError::ScanProgressRegression)?;
+    if removed_count > current.segments.len() {
+        return Err(StateStoreError::ScanProgressRegression);
+    }
+    let removed_rows = current.segments[..removed_count]
+        .iter()
+        .try_fold(0_u64, |rows, segment| rows.checked_add(segment.rows()))
+        .ok_or(StateStoreError::ScanProgressRegression)?;
+    let compacted_rows = current
+        .compacted_rows
+        .checked_add(removed_rows)
+        .ok_or(StateStoreError::ScanProgressRegression)?;
+    let mut expected = current.clone();
+    expected.compacted_through_sequence = next.compacted_through_sequence;
+    expected.compacted_rows = compacted_rows;
+    expected.segments.drain(..removed_count);
+    if expected == *next {
+        Ok(())
+    } else {
+        Err(StateStoreError::ScanProgressRegression)
+    }
 }
 
 fn cursor_strictly_advances(
@@ -994,6 +1159,77 @@ mod tests {
             .coordinator
             .start_attempt(fence)
             .expect("test attempt must start");
+        value.active_scan = Some(ActiveScan {
+            attempt_id: fence.attempt_id,
+            base_committed: value.coordinator.committed,
+            resume_after: None,
+            maximum_candidate: None,
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
+            next_page: 1,
+            complete: false,
+            segments: Vec::new(),
+            delivered_through_sequence: 0,
+        });
+        value
+    }
+
+    fn active_scan_with_two_segments() -> DurableInputState {
+        let mut value = state();
+        let fence = AttemptFence::new(
+            AttemptId::new([0x41; 16]),
+            value.coordinator.configuration_id,
+            value.coordinator.generation,
+        );
+        value
+            .coordinator
+            .start_attempt(fence)
+            .expect("test attempt must start");
+        let candidate = TimestampIdCursor::new(1_002, 12);
+        value.active_scan = Some(ActiveScan {
+            attempt_id: fence.attempt_id,
+            base_committed: value.coordinator.committed,
+            resume_after: Some(candidate),
+            maximum_candidate: Some(candidate),
+            compacted_through_sequence: 0,
+            compacted_rows: 0,
+            next_page: 3,
+            complete: false,
+            segments: vec![
+                crate::SegmentRef::new([0x51; 16], 1, 1, 1, [0x61; 32]),
+                crate::SegmentRef::new([0x52; 16], 2, 2, 1, [0x62; 32]),
+            ],
+            delivered_through_sequence: 0,
+        });
+        value
+    }
+
+    fn with_delivery_receipt(
+        mut value: DurableInputState,
+        delivered_through_sequence: u64,
+    ) -> DurableInputState {
+        value
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .delivered_through_sequence = delivered_through_sequence;
+        value
+    }
+
+    fn with_appended_segment(
+        mut value: DurableInputState,
+        segment_id: [u8; 16],
+        digest: [u8; 32],
+        candidate: TimestampIdCursor,
+    ) -> DurableInputState {
+        let scan = value.active_scan.as_mut().expect("scan exists");
+        let sequence = scan.next_page;
+        scan.resume_after = Some(candidate);
+        scan.maximum_candidate = Some(candidate);
+        scan.segments.push(crate::SegmentRef::new(
+            segment_id, sequence, sequence, 1, digest,
+        ));
+        scan.next_page = scan.next_page.checked_add(1).expect("page must advance");
         value
     }
 
@@ -1007,6 +1243,7 @@ mod tests {
     #[test]
     fn envelope_round_trip_and_header_are_stable() {
         let state = state();
+        assert_eq!(state.format_version, 2);
         let first = encode_envelope(&state, 9).expect("envelope encodes");
         let second = encode_envelope(&state, 9).expect("envelope encodes deterministically");
         assert_eq!(first, second);
@@ -1018,6 +1255,10 @@ mod tests {
         assert_eq!(decoded.value, state);
         assert_eq!(decoded.token.revision, 9);
         assert_eq!(&first[24..56], decoded.token.digest.as_slice());
+        let payload: serde_json::Value = serde_json::from_slice(&first[HEADER_BYTES..])
+            .expect("payload must contain canonical JSON");
+        assert!(payload.get("source_lineage_fingerprint").is_some());
+        assert!(payload.get("query_fingerprint").is_none());
     }
 
     #[test]
@@ -1155,6 +1396,37 @@ mod tests {
     }
 
     #[test]
+    fn input_inventory_is_non_creating_sorted_and_key_validated() {
+        let root = root("inventory");
+        let store = FileCheckpointStore::open(&root).expect("store must open");
+        assert_eq!(store.input_ids(), Ok(Vec::new()));
+        assert!(!root.exists(), "an empty inventory must not create state");
+
+        let first = state();
+        let first_key = StateKey::for_input(first.input_id);
+        store
+            .create(first_key, &first)
+            .expect("first state must be created");
+        let mut second = state();
+        second.input_id = InputId::new([0x12; 16]);
+        let second_key = StateKey::for_input(second.input_id);
+        store
+            .create(second_key, &second)
+            .expect("second state must be created");
+        assert_eq!(
+            store.input_ids(),
+            Ok(vec![InputId::new([0x11; 16]), InputId::new([0x12; 16])])
+        );
+
+        let rogue = root.join("inputs").join("0".repeat(64));
+        ensure_private_dir(&rogue).expect("rogue directory must be private");
+        fs::copy(store.current_path(first_key), rogue.join(CURRENT_FILE))
+            .expect("rogue envelope must be copied");
+        assert_eq!(store.input_ids(), Err(StateStoreError::StateKeyMismatch));
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
     fn previous_state_is_restored_as_a_new_revision() {
         let (root, store, key) = store("restore");
         let original_value = state();
@@ -1215,10 +1487,10 @@ mod tests {
             Err(StateStoreError::InvalidCheckpointTransition)
         );
 
-        let mut changed_query = state();
-        changed_query.query_fingerprint = Fingerprint::new([0x71; 32]);
+        let mut changed_lineage = state();
+        changed_lineage.source_lineage_fingerprint = Fingerprint::new([0x71; 32]);
         assert_eq!(
-            store.compare_exchange(key, initial.token, &changed_query),
+            store.compare_exchange(key, initial.token, &changed_lineage),
             Err(StateStoreError::IdentityMigrationRequired)
         );
 
@@ -1283,40 +1555,24 @@ mod tests {
     fn scan_progress_is_append_only_and_exact_commit_is_accepted() {
         let (root, store, key) = store("scan-progress");
         let initial = store.create(key, &state()).expect("state must be created");
-        let mut started = state();
-        let fence = AttemptFence::new(
-            AttemptId::new([0x41; 16]),
-            started.coordinator.configuration_id,
-            started.coordinator.generation,
-        );
-        started
+        let started = next_state(0x41);
+        let fence = started
             .coordinator
-            .start_attempt(fence)
-            .expect("attempt must start");
-        started.active_scan = Some(ActiveScan {
-            attempt_id: fence.attempt_id,
-            base_committed: started.coordinator.committed,
-            resume_after: None,
-            maximum_candidate: None,
-            next_page: 1,
-            complete: false,
-            segments: Vec::new(),
-        });
+            .active_attempt
+            .as_ref()
+            .expect("attempt exists")
+            .fence;
         let started = store
             .compare_exchange(key, initial.token, &started)
             .expect("attempt and empty scan must persist");
 
         let first_candidate = TimestampIdCursor::new(1_001, 11);
-        let mut first_page = started.value.clone();
-        first_page.active_scan = Some(ActiveScan {
-            attempt_id: fence.attempt_id,
-            base_committed: first_page.coordinator.committed,
-            resume_after: Some(first_candidate),
-            maximum_candidate: Some(first_candidate),
-            next_page: 2,
-            complete: false,
-            segments: vec![crate::SegmentRef::new([0x51; 16], 1, 1, 1, [0x61; 32])],
-        });
+        let first_page = with_appended_segment(
+            started.value.clone(),
+            [0x51; 16],
+            [0x61; 32],
+            first_candidate,
+        );
         let first_page = store
             .compare_exchange(key, started.token, &first_page)
             .expect("first sealed page must append");
@@ -1325,7 +1581,9 @@ mod tests {
         dropped.active_scan = None;
         assert_eq!(
             store.compare_exchange(key, first_page.token, &dropped),
-            Err(StateStoreError::ScanProgressRegression)
+            Err(StateStoreError::InvalidState(
+                StateValidationError::ActiveAttemptWithoutScan
+            ))
         );
 
         let mut regressed = first_page.value.clone();
@@ -1340,14 +1598,17 @@ mod tests {
         );
 
         let second_candidate = TimestampIdCursor::new(1_002, 12);
-        let mut completed = first_page.value.clone();
-        let scan = completed.active_scan.as_mut().expect("scan exists");
-        scan.resume_after = Some(second_candidate);
-        scan.maximum_candidate = Some(second_candidate);
-        scan.next_page = 3;
-        scan.complete = true;
-        scan.segments
-            .push(crate::SegmentRef::new([0x52; 16], 2, 2, 1, [0x62; 32]));
+        let mut completed = with_appended_segment(
+            first_page.value.clone(),
+            [0x52; 16],
+            [0x62; 32],
+            second_candidate,
+        );
+        completed
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .complete = true;
         completed
             .coordinator
             .collection_completed(fence, 2, Some(second_candidate))
@@ -1356,13 +1617,34 @@ mod tests {
             .compare_exchange(key, first_page.token, &completed)
             .expect("completed scan must persist");
 
-        let mut delivered = completed.value.clone();
+        let mut premature_delivery = completed.value.clone();
+        premature_delivery
+            .coordinator
+            .delivery_confirmed(fence, 2)
+            .expect("in-memory coordinator permits independent delivery completion");
+        assert_eq!(
+            store.compare_exchange(key, completed.token, &premature_delivery),
+            Err(StateStoreError::InvalidState(
+                StateValidationError::DeliveryConfirmationMismatch
+            ))
+        );
+
+        let first_receipt = with_delivery_receipt(completed.value.clone(), 1);
+        let first_receipt = store
+            .compare_exchange(key, completed.token, &first_receipt)
+            .expect("first delivery receipt must advance independently");
+        let fully_delivered = with_delivery_receipt(first_receipt.value.clone(), 2);
+        let fully_delivered = store
+            .compare_exchange(key, first_receipt.token, &fully_delivered)
+            .expect("final delivery receipt must advance independently");
+
+        let mut delivered = fully_delivered.value.clone();
         delivered
             .coordinator
             .delivery_confirmed(fence, 2)
             .expect("delivery must confirm");
         let delivered = store
-            .compare_exchange(key, completed.token, &delivered)
+            .compare_exchange(key, fully_delivered.token, &delivered)
             .expect("delivery state must persist");
         let mut committed = delivered.value.clone();
         committed
@@ -1377,6 +1659,207 @@ mod tests {
             committed.value.coordinator.committed,
             Some(second_candidate)
         );
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn scan_transition_accepts_one_segment_or_an_empty_final_page() {
+        let (root, store, key) = store("scan-append-cardinality");
+        let active = next_state(0x71);
+        let fence = active
+            .coordinator
+            .active_attempt
+            .as_ref()
+            .expect("attempt exists")
+            .fence;
+        let current = store
+            .create(key, &active)
+            .expect("active scan must be created");
+
+        let first_candidate = TimestampIdCursor::new(1_001, 11);
+        let first = with_appended_segment(
+            current.value.clone(),
+            [0x71; 16],
+            [0x81; 32],
+            first_candidate,
+        );
+        let two_at_once = with_appended_segment(
+            first,
+            [0x72; 16],
+            [0x82; 32],
+            TimestampIdCursor::new(1_002, 12),
+        );
+        assert_eq!(two_at_once.validate(), Ok(()));
+        assert_eq!(
+            store.compare_exchange(key, current.token, &two_at_once),
+            Err(StateStoreError::ScanProgressRegression)
+        );
+        assert_eq!(
+            store.compare_exchange(key, current.token, &current.value),
+            Err(StateStoreError::NoStateChange)
+        );
+
+        let mut empty_completion = current.value.clone();
+        empty_completion
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .complete = true;
+        empty_completion
+            .coordinator
+            .collection_completed(fence, 0, None)
+            .expect("empty collection must complete");
+        store
+            .compare_exchange(key, current.token, &empty_completion)
+            .expect("empty final page must complete without a segment");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn delivery_receipt_advances_alone_and_rejects_regression_or_overrun() {
+        let (root, store, key) = store("delivery-receipt");
+        let current = store
+            .create(key, &active_scan_with_two_segments())
+            .expect("active scan must be created");
+
+        let mut coupled = current.value.clone();
+        let coupled_scan = coupled.active_scan.as_mut().expect("scan exists");
+        coupled_scan.delivered_through_sequence = 1;
+        coupled_scan.maximum_candidate = Some(TimestampIdCursor::new(1_003, 13));
+        assert_eq!(
+            store.compare_exchange(key, current.token, &coupled),
+            Err(StateStoreError::ScanProgressRegression)
+        );
+
+        let mut skipped = current.value.clone();
+        skipped
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .delivered_through_sequence = 2;
+        assert_eq!(
+            store.compare_exchange(key, current.token, &skipped),
+            Err(StateStoreError::ScanProgressRegression)
+        );
+
+        let first = with_delivery_receipt(current.value.clone(), 1);
+        let first = store
+            .compare_exchange(key, current.token, &first)
+            .expect("first delivery receipt must advance");
+        let delivered = with_delivery_receipt(first.value.clone(), 2);
+        let delivered = store
+            .compare_exchange(key, first.token, &delivered)
+            .expect("second delivery receipt must advance");
+
+        let mut regressed = delivered.value.clone();
+        regressed
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .delivered_through_sequence = 1;
+        assert_eq!(
+            store.compare_exchange(key, delivered.token, &regressed),
+            Err(StateStoreError::ScanProgressRegression)
+        );
+
+        let mut beyond_references = delivered.value.clone();
+        beyond_references
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .delivered_through_sequence = 3;
+        assert_eq!(
+            store.compare_exchange(key, delivered.token, &beyond_references),
+            Err(StateStoreError::InvalidState(
+                StateValidationError::InvalidDeliveryReceipt
+            ))
+        );
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn compacted_receipt_prefix_preserves_global_scan_accounting() {
+        let (root, store, key) = store("compacted-receipt-prefix");
+        let current = store
+            .create(key, &active_scan_with_two_segments())
+            .expect("active scan must be created");
+        let first_receipt = with_delivery_receipt(current.value.clone(), 1);
+        let first_receipt = store
+            .compare_exchange(key, current.token, &first_receipt)
+            .expect("first delivery receipt must advance");
+
+        let mut wrong_rows = first_receipt.value.clone();
+        let wrong_scan = wrong_rows.active_scan.as_mut().expect("scan exists");
+        wrong_scan.compacted_through_sequence = 1;
+        wrong_scan.compacted_rows = 2;
+        wrong_scan.segments.remove(0);
+        assert_eq!(wrong_rows.validate(), Ok(()));
+        assert_eq!(
+            store.compare_exchange(key, first_receipt.token, &wrong_rows),
+            Err(StateStoreError::ScanProgressRegression)
+        );
+
+        let mut compacted = first_receipt.value.clone();
+        let compacted_scan = compacted.active_scan.as_mut().expect("scan exists");
+        compacted_scan.compacted_through_sequence = 1;
+        compacted_scan.compacted_rows = 1;
+        compacted_scan.segments.remove(0);
+        let compacted = store
+            .compare_exchange(key, first_receipt.token, &compacted)
+            .expect("receipted prefix must compact exactly");
+        let scan = compacted.value.active_scan.as_ref().expect("scan exists");
+        assert_eq!(scan.compacted_through_sequence, 1);
+        assert_eq!(scan.compacted_rows, 1);
+        assert_eq!(scan.next_page, 3);
+        assert_eq!(scan.segments.len(), 1);
+
+        let second_receipt = with_delivery_receipt(compacted.value.clone(), 2);
+        let second_receipt = store
+            .compare_exchange(key, compacted.token, &second_receipt)
+            .expect("receipt must advance across a compacted prefix");
+        let mut fully_compacted = second_receipt.value.clone();
+        let scan = fully_compacted.active_scan.as_mut().expect("scan exists");
+        scan.compacted_through_sequence = 2;
+        scan.compacted_rows = 2;
+        scan.segments.clear();
+        let fully_compacted = store
+            .compare_exchange(key, second_receipt.token, &fully_compacted)
+            .expect("second receipted prefix must compact");
+        let scan = fully_compacted
+            .value
+            .active_scan
+            .as_ref()
+            .expect("scan exists");
+        assert_eq!(scan.next_page, 3);
+        assert!(scan.segments.is_empty());
+        assert_eq!(scan.delivered_through_sequence, 2);
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn scan_append_cannot_also_advance_delivery_receipt() {
+        let (root, store, key) = store("append-with-delivery-receipt");
+        let mut one_segment = active_scan_with_two_segments();
+        let scan = one_segment.active_scan.as_mut().expect("scan exists");
+        scan.resume_after = Some(TimestampIdCursor::new(1_001, 11));
+        scan.maximum_candidate = scan.resume_after;
+        scan.next_page = 2;
+        scan.segments.pop();
+        let current = store
+            .create(key, &one_segment)
+            .expect("one-page scan must be created");
+
+        let mut appended_and_delivered = active_scan_with_two_segments();
+        appended_and_delivered
+            .active_scan
+            .as_mut()
+            .expect("scan exists")
+            .delivered_through_sequence = 1;
+        assert_eq!(
+            store.compare_exchange(key, current.token, &appended_and_delivered),
+            Err(StateStoreError::ScanProgressRegression)
+        );
+        assert_eq!(store.load(key), Ok(LoadResult::Current(Box::new(current))));
         fs::remove_dir_all(root).expect("fixture must be removed");
     }
 

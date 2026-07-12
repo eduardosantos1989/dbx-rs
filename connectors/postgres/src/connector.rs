@@ -533,7 +533,22 @@ impl Connector for PostgresConnector {
         if let Some(query) = &request.query {
             match request.max_rows {
                 Some(max_rows) => {
-                    if let Err(error) = Self::validate_query(query.as_str(), max_rows) {
+                    let validation = request.cursor.as_ref().map_or_else(
+                        || Self::validate_query(query.as_str(), max_rows),
+                        |spec| {
+                            normalize_typed_query(
+                                query.as_str(),
+                                max_rows,
+                                Some(&TimestampIdCursorRequest {
+                                    spec: spec.clone(),
+                                    committed: None,
+                                    resume_after: None,
+                                }),
+                            )
+                            .map(|_| ())
+                        },
+                    );
+                    if let Err(error) = validation {
                         report.issues.push(ValidationIssue {
                             code: error.code().to_owned(),
                             field: "query".into(),
@@ -784,6 +799,7 @@ fn normalize_typed_query(
             cursor_bound: None,
         });
     };
+    reject_cursor_pagination(&base)?;
 
     let cursor_bound = cursor.effective_bound().map_err(|_| {
         ConnectorError::new(
@@ -820,6 +836,169 @@ fn normalize_typed_query(
         sql,
         cursor_bound,
     })
+}
+
+fn reject_cursor_pagination(query: &str) -> Result<(), ConnectorError> {
+    if contains_postgres_pagination_keyword(query) {
+        return Err(ConnectorError::new(
+            "DBX-RS-PG-CFG-0050",
+            ErrorClass::Configuration,
+            "PostgreSQL cursor base query must not contain LIMIT, OFFSET, or FETCH",
+            false,
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn contains_postgres_pagination_keyword(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        match bytes[position] {
+            b'\'' => position = skip_single_quoted(bytes, position),
+            b'"' => position = skip_doubled_quote(bytes, position, b'"'),
+            b'-' if bytes.get(position + 1) == Some(&b'-') => {
+                position = skip_line_comment(bytes, position + 2);
+            }
+            b'/' if bytes.get(position + 1) == Some(&b'*') => {
+                position = skip_block_comment(bytes, position + 2);
+            }
+            b'$' => {
+                if let Some(delimiter_end) = dollar_quote_delimiter_end(bytes, position) {
+                    position = skip_dollar_quoted(bytes, position, delimiter_end);
+                } else {
+                    position += 1;
+                }
+            }
+            byte if is_postgres_identifier_start(byte) => {
+                let start = position;
+                position += 1;
+                while position < bytes.len() && is_postgres_identifier_continue(bytes[position]) {
+                    position += 1;
+                }
+                let token = &bytes[start..position];
+                if token.eq_ignore_ascii_case(b"limit")
+                    || token.eq_ignore_ascii_case(b"offset")
+                    || token.eq_ignore_ascii_case(b"fetch")
+                {
+                    return true;
+                }
+            }
+            _ => position += 1,
+        }
+    }
+    false
+}
+
+fn skip_single_quoted(bytes: &[u8], start: usize) -> usize {
+    let escape_backslash = has_escape_string_prefix(bytes, start);
+    let mut position = start + 1;
+    while position < bytes.len() {
+        if bytes[position] == b'\'' {
+            if bytes.get(position + 1) == Some(&b'\'') {
+                position += 2;
+            } else {
+                return position + 1;
+            }
+        } else if escape_backslash && bytes[position] == b'\\' {
+            position = position.saturating_add(2).min(bytes.len());
+        } else {
+            position += 1;
+        }
+    }
+    position
+}
+
+fn has_escape_string_prefix(bytes: &[u8], quote: usize) -> bool {
+    let has_e_prefix = quote >= 1
+        && matches!(bytes[quote - 1], b'e' | b'E')
+        && (quote == 1 || !is_postgres_identifier_continue(bytes[quote - 2]));
+    let has_unicode_prefix = quote >= 2
+        && bytes[quote - 1] == b'&'
+        && matches!(bytes[quote - 2], b'u' | b'U')
+        && (quote == 2 || !is_postgres_identifier_continue(bytes[quote - 3]));
+    has_e_prefix || has_unicode_prefix
+}
+
+fn skip_doubled_quote(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut position = start + 1;
+    while position < bytes.len() {
+        if bytes[position] == quote {
+            if bytes.get(position + 1) == Some(&quote) {
+                position += 2;
+            } else {
+                return position + 1;
+            }
+        } else {
+            position += 1;
+        }
+    }
+    position
+}
+
+fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
+    bytes[start..]
+        .iter()
+        .position(|byte| matches!(byte, b'\n' | b'\r'))
+        .map_or(bytes.len(), |offset| start + offset + 1)
+}
+
+fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1_usize;
+    let mut position = start;
+    while position < bytes.len() {
+        if bytes[position] == b'/' && bytes.get(position + 1) == Some(&b'*') {
+            depth += 1;
+            position += 2;
+        } else if bytes[position] == b'*' && bytes.get(position + 1) == Some(&b'/') {
+            depth -= 1;
+            position += 2;
+            if depth == 0 {
+                return position;
+            }
+        } else {
+            position += 1;
+        }
+    }
+    position
+}
+
+fn dollar_quote_delimiter_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start + 1)?;
+    if first == b'$' {
+        return Some(start + 2);
+    }
+    if !is_postgres_identifier_start(first) {
+        return None;
+    }
+    let mut position = start + 2;
+    while position < bytes.len() && is_dollar_tag_continue(bytes[position]) {
+        position += 1;
+    }
+    (bytes.get(position) == Some(&b'$')).then_some(position + 1)
+}
+
+fn skip_dollar_quoted(bytes: &[u8], start: usize, delimiter_end: usize) -> usize {
+    let delimiter = &bytes[start..delimiter_end];
+    bytes[delimiter_end..]
+        .windows(delimiter.len())
+        .position(|window| window == delimiter)
+        .map_or(bytes.len(), |offset| {
+            delimiter_end + offset + delimiter.len()
+        })
+}
+
+const fn is_postgres_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || byte >= 0x80
+}
+
+const fn is_postgres_identifier_continue(byte: u8) -> bool {
+    is_postgres_identifier_start(byte) || byte.is_ascii_digit() || byte == b'$'
+}
+
+const fn is_dollar_tag_continue(byte: u8) -> bool {
+    is_postgres_identifier_start(byte) || byte.is_ascii_digit()
 }
 
 fn quote_postgres_identifier(identifier: &str) -> String {
@@ -1076,6 +1255,60 @@ mod tests {
             .expect("duplicate cursor fields must fail");
 
         assert_eq!(error.code(), "DBX-RS-PG-CFG-0046");
+    }
+
+    #[test]
+    fn cursor_query_rejects_inner_pagination_clauses() {
+        let cursor = cursor_request("updated_at", "id", Duration::ZERO, None);
+
+        for query in [
+            "SELECT updated_at, id FROM events LIMIT 10",
+            "SELECT updated_at, id FROM events oFfSeT 5",
+            "SELECT updated_at, id FROM events FETCH NEXT 10 ROWS ONLY",
+            "WITH recent AS (SELECT updated_at, id FROM events LIMIT 10) SELECT * FROM recent",
+        ] {
+            let error = normalize_typed_query(query, 5, Some(&cursor))
+                .err()
+                .expect("cursor pagination in the base query must fail");
+
+            assert_eq!(error.code(), "DBX-RS-PG-CFG-0050");
+            assert_eq!(
+                error.message(),
+                "PostgreSQL cursor base query must not contain LIMIT, OFFSET, or FETCH"
+            );
+            assert!(!error.message().contains("events"));
+        }
+    }
+
+    #[test]
+    fn cursor_pagination_scan_ignores_non_executable_keyword_text() {
+        let cursor = cursor_request("updated_at", "id", Duration::ZERO, None);
+        let query = r#"
+            SELECT updated_at, id, 'LIMIT '' OFFSET' AS note,
+                   E'escaped \' LIMIT OFFSET FETCH' AS escaped,
+                   "LIMIT", $body$OFFSET LIMIT FETCH$body$,
+                   limit_value, offset_value, fetch_value
+            -- LIMIT OFFSET FETCH
+            FROM events /* outer LIMIT /* nested OFFSET FETCH */ complete */
+        "#;
+
+        normalize_typed_query(query, 5, Some(&cursor))
+            .expect("quoted and commented pagination text must be accepted");
+    }
+
+    #[test]
+    fn ordinary_query_keeps_existing_inner_pagination_behavior() {
+        for query in [
+            "SELECT updated_at, id FROM events LIMIT 10",
+            "SELECT updated_at, id FROM events OFFSET 5",
+            "SELECT updated_at, id FROM events FETCH FIRST 10 ROWS ONLY",
+        ] {
+            let normalized = normalize_typed_query(query, 5, None)
+                .expect("ordinary queries may retain their own pagination");
+
+            assert_eq!(normalized.base, query);
+            assert!(normalized.sql.contains(query));
+        }
     }
 
     #[test]

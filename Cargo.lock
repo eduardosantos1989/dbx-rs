@@ -419,11 +419,13 @@ name = "dbx-rs-daemon"
 version = "0.1.0"
 dependencies = [
  "configparser",
+ "dbx-rs-checkpoint",
  "dbx-rs-config",
  "dbx-rs-connector-sdk",
  "dbx-rs-native-connectors",
  "dbx-rs-secure-store",
  "dbx-rs-spool",
+ "dbx-rs-state",
  "dbx-rs-telemetry",
  "http",
  "rcgen",

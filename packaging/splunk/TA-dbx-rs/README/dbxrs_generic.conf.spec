@@ -31,9 +31,24 @@ spool_key_file = <absolute path>
 
 state_dir = <absolute path>
 * Durable checkpoint state below $SPLUNK_HOME/var.
+* On the first daemon run, an owner-only fixed marker is created at
+  $SPLUNK_HOME/var/lib/splunk/dbx-rs/state-root.binding and binds the installation to this exact
+  path. The path is immutable afterward; state-root relocation and migration are not implemented.
+* Back up and restore the binding marker with the checkpoint state.
+* Current checkpoints use durable state payload format v2. A payload-v1-only binary cannot read or
+  rewrite this state.
 
 spool_dir = <absolute path>
 * Encrypted durable event spool below $SPLUNK_HOME/var.
+* New segments use encrypted spool format v2. The current reader accepts v1 and v2 segments, but a
+  spool-v1-only binary cannot read v2 segments.
+* Before rollback, stop the daemon and preserve the complete state directory, state-root binding
+  marker, spool directory, and spool key together. A v2-capable binary must drain every v2 spool
+  segment before a spool-v1-only binary starts; retained v2 segments require continuing with a
+  v2-capable binary.
+* Draining spool data does not downgrade durable rising state. Rollback to a payload-v1-only binary
+  requires a matched pre-v2 state, binding-marker, spool, and key backup. Deleting retained state or
+  spool data is not a rollback procedure.
 
 managed_inputs_file = <absolute path>
 * Splunk inputs.conf file updated when manage_input is true.
@@ -125,4 +140,7 @@ source = <label>
 * Default HEC source.
 
 use_ack = <boolean>
-* Waits for Splunk indexer acknowledgment before declaring a batch delivered.
+* Waits for Splunk indexer acknowledgment before declaring a spool segment delivered.
+* Rising checkpoints advance only after all pages cross this configured boundary. When false, HTTP
+  acceptance is the weaker boundary. Interrupted or uncertain outcomes can be replayed under the
+  at-least-once delivery contract.

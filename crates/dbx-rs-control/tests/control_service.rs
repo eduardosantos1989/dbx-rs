@@ -95,6 +95,35 @@ fn named_validation_checks_assets_and_existing_secret_without_disclosure() {
 }
 
 #[test]
+fn named_validation_rejects_rising_query_with_inner_pagination() {
+    let fixture = Fixture::new(Some("warehouse"));
+    let configured = input_config("warehouse")
+        .replace(
+            "disabled = false\n",
+            "disabled = false\nmode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\ncursor_timestamp_field = updated_at\ncursor_id_field = id\n",
+        )
+        .replace(
+            &format!("query = SELECT '{QUERY_MARKER}' AS marker"),
+            "query = SELECT updated_at, id FROM events FETCH FIRST 10 ROWS ONLY",
+        );
+    fs::write(
+        fixture.app_home.join("default/dbxrs_inputs.conf"),
+        configured,
+    )
+    .expect("rising input configuration must be written");
+
+    let response = fixture
+        .service()
+        .validate_input("warehouse")
+        .expect("validation operation must complete");
+
+    assert!(!response.valid);
+    assert_eq!(response.issues.len(), 1);
+    assert_eq!(response.issues[0].code, "DBX-RS-PG-CFG-0050");
+    assert_eq!(response.issues[0].field, "query");
+}
+
+#[test]
 fn missing_secret_is_a_validation_issue_and_is_not_created() {
     let fixture = Fixture::new(None);
     let secret_file = fixture
