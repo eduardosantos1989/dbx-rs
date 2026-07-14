@@ -4,8 +4,8 @@ disabled = <boolean>
 
 mode = batch | rising
 * Optional collection mode. Omitted mode defaults to batch for existing stanzas.
-* Rising mode uses a durable TIMESTAMPTZ-plus-BIGINT cursor. Batch stanzas must not configure any
-  rising-only settings below.
+* Rising mode is supported only by PostgreSQL and uses a durable TIMESTAMPTZ-plus-BIGINT cursor.
+  Oracle is batch-only. Batch stanzas must not configure any rising-only settings below.
 * A rising scan collects, seals, reconciles, and delivers one bounded page at a time. Every
   non-empty page is an authenticated durable spool segment before HEC delivery can begin. Startup
   reconciles sealed-page recovery metadata before replay or another page is collected.
@@ -47,8 +47,9 @@ cursor_overlap_secs = <non-negative integer>
 * Splunk can still receive the same identity more than once under at-least-once delivery when a HEC
   acceptance or acknowledgment outcome is uncertain. Use dbxrs_event_id for downstream dedupe.
 
-connector = postgres
-* Native connector identifier. PostgreSQL is currently implemented.
+connector = postgres | oracle
+* Native connector identifier. PostgreSQL is Native Certified. Oracle is Experimental Native and
+  supports batch mode only.
 
 interval_secs = <positive integer>
 * Delay from one completed collection to the next run.
@@ -73,11 +74,13 @@ tls_server_name = <DNS name>
 
 tls_ca_file = <absolute path>
 * Optional PEM CA bundle. Supports an initial $SPLUNK_HOME/ path component.
-* PostgreSQL certificate files must resolve below the app's certs/psql directory.
+* PostgreSQL certificate files must resolve below certs/psql. Oracle certificate files must resolve
+  below certs/oracle.
 
 query_file = <absolute path>
 * UTF-8 SELECT or WITH query file. SQL is not written to operational logs.
-* PostgreSQL query files must resolve below the app's queries/psql directory.
+* PostgreSQL query files must resolve below queries/psql. Oracle query files must resolve below
+  queries/oracle.
 
 query = <SQL text>
 * Inline SELECT or WITH query for short definitions.
@@ -96,6 +99,8 @@ max_bytes = <positive integer>
   and encryption overhead. Raise spool.segment_max_bytes or lower these input limits if validation
   reports input.spool_bound.
 * Hard maximum: 1073741824 unencoded row bytes per batch run or rising query page.
+* PostgreSQL bytea retains its existing lowercase \\x-prefixed hexadecimal JSON string. Oracle RAW
+  is emitted losslessly as a lowercase hex:-prefixed JSON string.
 
 index = <label>
 sourcetype = <label>

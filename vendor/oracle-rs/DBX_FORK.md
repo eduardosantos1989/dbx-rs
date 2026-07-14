@@ -27,6 +27,10 @@ The dbx-rs patch series is intentionally limited to the experimental native feas
 - Oracle-version-aware response parsing, strict server-version derivation, and multi-packet
   query/fetch continuation, including bounded row-header duplicate bit vectors and explicit
   previous-row continuity across fetch pages;
+- Oracle authentication completion, bounded server-side piggyback decoding, and database-version
+  extraction for negotiated 19c-era field layouts;
+- CONNECT packet parity plus TCPS handling for Oracle's pre-ACCEPT TLS RESEND transition, which
+  rebuilds verified TLS on the retained TCP socket before replaying CONNECT;
 - explicit DNS/TCP failure separation and negotiated AL32UTF8/AL16UTF16 enforcement;
 - immediate connection termination for timeout and cancellation cleanup;
 - strict non-lossy protocol, authentication, and wire-type decoding, including canonical Oracle
@@ -37,16 +41,38 @@ The dbx-rs patch series is intentionally limited to the experimental native feas
 The isolated connector starts execution with `SET TRANSACTION READ ONLY` and includes ignored,
 environment-gated live tests for Oracle 19c probe/query, direct packet observation plus connector-
 level continuation through 20,001 rows, exact core types over verified TLS, negative TLS and
-authentication, unsupported-type rejection, and cancellation cleanup. Compiling those fixtures is
-offline evidence; they must run against an authorized sandbox before any certification or
-integration decision.
+authentication, unsupported-type rejection, and cancellation cleanup. On 2026-07-14, all seven
+tests passed serially against the authorized Oracle 19.3 sandbox. This authorizes narrow
+Experimental Native product integration; it is not certification evidence for other Oracle
+versions or configurations.
 
 Encrypted Oracle wallet keys are outside this constrained fork and fail closed instead of falling
 back to unauthenticated client TLS. The dbx-rs connector exposes password authentication with
 either verified TCPS or explicitly disabled TLS; it does not expose wallet or client-certificate
 configuration.
 
-This fork is not evidence of Oracle certification. Live Oracle 19c query, continuation,
-cancellation-cleanup, TLS, type-corpus, and compatibility tests plus inspection of the eventual
-shipped static-musl artifact remain mandatory before registry, daemon, configuration, or packaging
-integration.
+## Ownership and update policy
+
+dbx-rs accepts ownership of this pinned fork for the Experimental Native Oracle connector under
+these constraints:
+
+- preserve the crates.io archive hash above and record the exact upstream tag or commit considered
+  for every update;
+- review upstream releases and RustSec advisories for direct and transitive dependencies during
+  each dependency-maintenance cycle and before every release containing Oracle support;
+- keep dbx-rs changes as reviewable protocol, bounds, transport, and connector-enablement patches;
+  every behavior change requires a focused regression and redacted evidence;
+- rebase in a dedicated change, compare the complete source and dependency diff, rerun fork,
+  connector, workspace, live 19c, static-musl, ELF, license, deny, secret, and unsafe-code gates;
+- do not silently replace the fork with OCI, ODPI-C, a system client, JDBC, or a JVM fallback;
+- treat Oracle 23ai field-version-18 token behavior as synthetic until its dedicated live gate
+  passes, and keep the support tier Experimental Native until an approved compatibility matrix is
+  complete.
+
+Rollback from a fork update means restoring the previously checksummed source and lock resolution,
+rerunning the same gates, disabling Oracle stanzas during runtime rollback, and preserving ready
+spool segments until they are deliberately drained or retained.
+
+This fork is not evidence of Oracle certification. On 2026-07-14, the exact all-features static-musl
+CLI and daemon passed ELF inspection, scheduled Oracle-to-Splunk HEC ACK delivery, and retained-ready
+restart replay. Repeat those artifact and durability gates for every release containing this fork.

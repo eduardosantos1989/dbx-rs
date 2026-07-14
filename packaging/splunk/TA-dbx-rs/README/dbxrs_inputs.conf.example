@@ -47,3 +47,26 @@ max_bytes = 1048576
 index = dbx_rs_test
 sourcetype = dbx_rs:postgres:row
 source = dbx_rs:example_postgres_rising
+
+[example_oracle]
+disabled = true
+mode = batch
+connector = oracle
+interval_secs = 60
+host = oracle.example
+port = 2484
+database = ORCLPDB1
+username = dbx_reader
+secret_ref = local:example_oracle
+tls_mode = verify-full
+tls_server_name = oracle.example
+tls_ca_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/certs/oracle/database-ca.pem
+query_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/queries/oracle/example.sql
+connect_timeout_secs = 10
+probe_timeout_secs = 10
+query_timeout_secs = 30
+max_rows = 1000
+max_bytes = 1048576
+index = dbx_rs_test
+sourcetype = dbx_rs:oracle:row
+source = dbx_rs:example_oracle

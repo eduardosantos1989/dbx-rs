@@ -222,13 +222,38 @@ async fn oracle_19c_probe_and_one_row_query_pass() {
         env::var("DBX_RS_LIVE_ORACLE_VERSION_PREFIX").unwrap_or_else(|_| "19".into());
     assert!(
         report.server_version.starts_with(&expected_version),
-        "live Oracle server version does not match the configured prefix"
+        "live Oracle server version {:?} does not match prefix {:?}",
+        report.server_version,
+        expected_version,
     );
+
+    let query = "SELECT CAST(1 AS NUMBER(1,0)) AS value FROM DUAL";
+    let native = Connection::connect_with_config(native_config(&connection, &secret))
+        .await
+        .expect("live native Oracle connection must succeed");
+    native
+        .execute("SET TRANSACTION READ ONLY", &[])
+        .await
+        .expect("live Oracle read-only transaction setup must succeed");
+    let direct = native
+        .query_with_fetch_size(query, &[], 1)
+        .await
+        .expect("live native Oracle one-row query must succeed");
+    assert_eq!(direct.rows.len(), 1);
+    if direct.has_more_rows {
+        let trailing = native
+            .fetch_more_with_previous_row(direct.cursor_id, &direct.columns, direct.rows.last(), 1)
+            .await
+            .expect("live native Oracle one-row continuation must succeed");
+        assert!(trailing.rows.is_empty());
+        assert!(!trailing.has_more_rows);
+    }
+    native.abort().await;
 
     let request = execution_request(
         "live-oracle-one-row",
         connection,
-        "SELECT CAST(1 AS NUMBER(1,0)) AS value FROM DUAL".into(),
+        query.into(),
         1,
         1,
         Duration::from_secs(20),

@@ -73,22 +73,24 @@ impl ConnectMessage {
         let mut service_opts = service_options::DONT_CARE;
         let mut connect_flags_2 = 0u32;
 
-        // Enable OOB support
-        service_opts |= service_options::CAN_RECV_ATTENTION;
-        connect_flags_2 |= connection::CHECK_OOB;
+        let supports_oob = !config.is_tls_enabled();
+        if supports_oob {
+            service_opts |= service_options::CAN_RECV_ATTENTION;
+            connect_flags_2 |= connection::CHECK_OOB;
+        }
 
         Self {
             version_desired: version::DESIRED,
             version_minimum: version::MINIMUM,
             service_options: service_opts,
             sdu: config.sdu,
-            tdu: connection::DEFAULT_TDU as u32,
+            tdu: config.sdu,
             protocol_characteristics: connection::PROTOCOL_CHARACTERISTICS,
             nsi_flags: nsi_flags::SUPPORT_SECURITY_RENEG | nsi_flags::DISABLE_NA,
             connect_flags_1: 0,
             connect_flags_2,
             connect_data,
-            supports_oob: true,
+            supports_oob,
         }
     }
 
@@ -269,8 +271,24 @@ mod tests {
         assert_eq!(msg.version_desired, version::DESIRED);
         assert_eq!(msg.version_minimum, version::MINIMUM);
         assert_eq!(msg.sdu, config.sdu);
+        assert_eq!(msg.tdu, config.sdu);
         assert!(msg.connect_data.contains("FREEPDB1"));
         assert!(msg.connect_data.contains("localhost"));
+        assert!(msg.supports_oob);
+        assert_ne!(msg.service_options & service_options::CAN_RECV_ATTENTION, 0);
+        assert_ne!(msg.connect_flags_2 & connection::CHECK_OOB, 0);
+    }
+
+    #[test]
+    fn test_tls_connect_message_does_not_advertise_oob() {
+        let config = Config::new("localhost", 2484, "FREEPDB1", "user", "pass")
+            .with_tls()
+            .unwrap();
+        let msg = ConnectMessage::from_config(&config);
+
+        assert!(!msg.supports_oob);
+        assert_eq!(msg.service_options & service_options::CAN_RECV_ATTENTION, 0);
+        assert_eq!(msg.connect_flags_2 & connection::CHECK_OOB, 0);
     }
 
     #[test]
@@ -286,6 +304,12 @@ mod tests {
         // Check version in packet
         assert_eq!(packet[8], (version::DESIRED >> 8) as u8);
         assert_eq!(packet[9], (version::DESIRED & 0xff) as u8);
+
+        // Oracle thin clients advertise TDU equal to SDU in both field widths.
+        assert_eq!(&packet[14..16], &(config.sdu as u16).to_be_bytes());
+        assert_eq!(&packet[16..18], &(config.sdu as u16).to_be_bytes());
+        assert_eq!(&packet[58..62], &config.sdu.to_be_bytes());
+        assert_eq!(&packet[62..66], &config.sdu.to_be_bytes());
     }
 
     #[test]

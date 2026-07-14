@@ -505,6 +505,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "dbx-rs-connector-oracle",
  "dbx-rs-connector-postgres",
  "dbx-rs-connector-sdk",
  "serde",

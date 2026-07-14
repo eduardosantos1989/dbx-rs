@@ -432,6 +432,7 @@ pub mod ccap_value {
     pub const FIELD_VERSION_12_1: u8 = 7;
     pub const FIELD_VERSION_12_2: u8 = 8;
     pub const FIELD_VERSION_18_1: u8 = 10;
+    pub const FIELD_VERSION_18_1_EXT_1: u8 = 11;
     pub const FIELD_VERSION_19_1: u8 = 12;
     pub const FIELD_VERSION_20_1: u8 = 14;
     pub const FIELD_VERSION_21_1: u8 = 16;

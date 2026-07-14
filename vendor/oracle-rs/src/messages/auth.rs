@@ -27,6 +27,7 @@ use crate::packet::PacketHeader;
 use super::token::{
     NON_PIPELINED_TOKEN_NUMBER, validate_response_token, write_request_token,
 };
+use super::{SessionIdentity, parse_error_info_with_rowcount_for_version, parse_server_side_piggyback};
 
 /// Session data received from server during authentication
 #[derive(Debug, Default)]
@@ -115,6 +116,8 @@ pub struct AuthMessage {
     _service_name: String,
     /// Sequence number for protocol messages
     sequence_number: u8,
+    /// Session identity returned by a server-side authentication piggyback.
+    session_identity: Option<SessionIdentity>,
 }
 
 /// Authentication phase
@@ -160,6 +163,7 @@ impl AuthMessage {
             driver_name: format!("oracle-rs : {}", env!("CARGO_PKG_VERSION")),
             _service_name: service_name.to_string(),
             sequence_number: 1,
+            session_identity: None,
         }
     }
 
@@ -193,6 +197,37 @@ impl AuthMessage {
     /// Get the combo key (for subsequent encryption)
     pub fn combo_key(&self) -> Option<&[u8]> {
         self.combo_key.as_deref()
+    }
+
+    pub(crate) fn session_identity(&self) -> Option<SessionIdentity> {
+        self.session_identity
+    }
+
+    pub(crate) fn database_version(&self, ttc_field_version: u8) -> Option<String> {
+        let version = self.session_data.auth_version_no?;
+        let components = if ttc_field_version
+            >= crate::constants::ccap_value::FIELD_VERSION_18_1_EXT_1
+        {
+            [
+                (version >> 24) & 0xff,
+                (version >> 16) & 0xff,
+                (version >> 12) & 0x0f,
+                (version >> 4) & 0xff,
+                version & 0x0f,
+            ]
+        } else {
+            [
+                (version >> 24) & 0xff,
+                (version >> 20) & 0x0f,
+                (version >> 12) & 0x0f,
+                (version >> 8) & 0x0f,
+                version & 0x0f,
+            ]
+        };
+        Some(format!(
+            "{}.{}.{}.{}.{}",
+            components[0], components[1], components[2], components[3], components[4]
+        ))
     }
 
     /// Build the authentication request packet for the current phase
@@ -406,7 +441,7 @@ impl AuthMessage {
     }
 
     /// Parse the authentication response and advance to next phase
-    pub fn parse_response(&mut self, payload: &[u8]) -> Result<()> {
+    pub fn parse_response(&mut self, payload: &[u8], ttc_field_version: u8) -> Result<()> {
         let mut buf = ReadBuffer::from_slice(payload);
 
         // Skip data flags
@@ -444,13 +479,27 @@ impl AuthMessage {
                     buf.skip_ub4()?;
                     buf.skip_ub2()?;
                 }
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    if let Some(identity) = parse_server_side_piggyback(&mut buf)? {
+                        self.session_identity = Some(identity);
+                    }
+                }
                 x if x == MessageType::EndOfResponse as u8 => {
                     end_of_response = true;
                 }
                 x if x == MessageType::Error as u8 => {
-                    return Err(Error::AuthenticationFailed(
-                        "Server returned error".to_string(),
-                    ));
+                    let (error_code, _, _, _) =
+                        parse_error_info_with_rowcount_for_version(&mut buf, ttc_field_version)?;
+                    if error_code != 0 {
+                        return Err(if matches!(error_code, 1017 | 28000) {
+                            Error::InvalidCredentials
+                        } else {
+                            Error::OracleError {
+                                code: error_code,
+                                message: "authentication failed".to_string(),
+                            }
+                        });
+                    }
                 }
                 _ => return Err(Error::InvalidMessageType(msg_type)),
             }
@@ -703,6 +752,45 @@ impl Drop for AuthMessage {
 mod tests {
     use super::*;
 
+    fn write_error_info(buffer: &mut WriteBuffer, error_code: u32, ttc_field_version: u8) {
+        buffer.write_ub4(0).unwrap();
+        buffer.write_ub2(0).unwrap();
+        buffer.write_ub4(0).unwrap();
+        for _ in 0..3 {
+            buffer.write_ub2(0).unwrap();
+        }
+        buffer.write_ub2(0).unwrap();
+        buffer.write_u8(0).unwrap();
+        for _ in 0..6 {
+            buffer.write_ub1(0).unwrap();
+        }
+        buffer.write_ub4(0).unwrap();
+        buffer.write_ub2(0).unwrap();
+        buffer.write_ub1(0).unwrap();
+        buffer.write_ub4(0).unwrap();
+        buffer.write_ub2(0).unwrap();
+        buffer.write_ub4(0).unwrap();
+        buffer.write_ub1(0).unwrap();
+        buffer.write_ub1(0).unwrap();
+        buffer.write_ub2(0).unwrap();
+        buffer.write_ub4(0).unwrap();
+        buffer.write_ub4(0).unwrap();
+        buffer.write_ub2(0).unwrap();
+        buffer.write_ub4(0).unwrap();
+        buffer.write_ub2(0).unwrap();
+        buffer.write_ub4(error_code).unwrap();
+        buffer.write_ub8(0).unwrap();
+        if ttc_field_version >= crate::constants::ccap_value::FIELD_VERSION_20_1 {
+            buffer.write_ub4(0).unwrap();
+            buffer.write_ub4(0).unwrap();
+        }
+        if error_code != 0 {
+            buffer
+                .write_string_with_length(Some("private server authentication detail"))
+                .unwrap();
+        }
+    }
+
     #[test]
     fn test_auth_message_creation() {
         let msg = AuthMessage::new("SCOTT", b"tiger", "FREEPDB1");
@@ -729,6 +817,30 @@ mod tests {
         assert_eq!(data.auth_sesskey, Some("AABBCCDD".to_string()));
         assert_eq!(data.auth_vfr_data, Some("11223344".to_string()));
         assert_eq!(data.auth_pbkdf2_vgen_count, Some(4096));
+    }
+
+    #[test]
+    fn database_version_uses_18c_and_newer_packing() {
+        let mut msg = AuthMessage::new("USER", b"secret", "DB");
+        msg.session_data.auth_version_no = Some((19 << 24) | (3 << 16));
+
+        assert_eq!(
+            msg.database_version(crate::constants::ccap_value::FIELD_VERSION_19_1)
+                .as_deref(),
+            Some("19.3.0.0.0")
+        );
+    }
+
+    #[test]
+    fn database_version_uses_legacy_packing() {
+        let mut msg = AuthMessage::new("USER", b"secret", "DB");
+        msg.session_data.auth_version_no = Some((12 << 24) | (2 << 20) | (1 << 8));
+
+        assert_eq!(
+            msg.database_version(crate::constants::ccap_value::FIELD_VERSION_12_2)
+                .as_deref(),
+            Some("12.2.0.1.0")
+        );
     }
 
     #[test]
@@ -804,7 +916,11 @@ mod tests {
         payload.write_ub2(0).unwrap();
         payload.write_u8(MessageType::EndOfResponse as u8).unwrap();
 
-        msg.parse_response(payload.as_slice()).unwrap();
+        msg.parse_response(
+            payload.as_slice(),
+            crate::constants::ccap_value::FIELD_VERSION_MAX,
+        )
+        .unwrap();
         assert_eq!(msg.phase(), AuthPhase::Complete);
     }
 
@@ -819,7 +935,61 @@ mod tests {
         payload.write_u8(MessageType::Parameter as u8).unwrap();
         payload.write_ub2(0).unwrap();
 
-        assert!(matches!(msg.parse_response(payload.as_slice()), Err(Error::Protocol(_))));
+        assert!(matches!(
+            msg.parse_response(
+                payload.as_slice(),
+                crate::constants::ccap_value::FIELD_VERSION_MAX,
+            ),
+            Err(Error::Protocol(_))
+        ));
         assert_eq!(msg.phase(), AuthPhase::Complete);
+    }
+
+    #[test]
+    fn auth_response_accepts_zero_code_error_info_as_completion() {
+        let mut msg = AuthMessage::new("USER", b"secret", "DB");
+        msg.phase = AuthPhase::Complete;
+        let mut payload = WriteBuffer::new();
+        payload.write_u16_be(0).unwrap();
+        payload.write_u8(MessageType::Parameter as u8).unwrap();
+        payload.write_ub2(0).unwrap();
+        payload.write_u8(MessageType::Error as u8).unwrap();
+        write_error_info(
+            &mut payload,
+            0,
+            crate::constants::ccap_value::FIELD_VERSION_19_1,
+        );
+
+        msg.parse_response(
+            payload.as_slice(),
+            crate::constants::ccap_value::FIELD_VERSION_19_1,
+        )
+        .unwrap();
+        assert_eq!(msg.phase(), AuthPhase::Complete);
+    }
+
+    #[test]
+    fn auth_response_redacts_invalid_credential_completion() {
+        let mut msg = AuthMessage::new("USER", b"secret", "DB");
+        msg.phase = AuthPhase::Complete;
+        let mut payload = WriteBuffer::new();
+        payload.write_u16_be(0).unwrap();
+        payload.write_u8(MessageType::Parameter as u8).unwrap();
+        payload.write_ub2(0).unwrap();
+        payload.write_u8(MessageType::Error as u8).unwrap();
+        write_error_info(
+            &mut payload,
+            1017,
+            crate::constants::ccap_value::FIELD_VERSION_19_1,
+        );
+
+        let error = msg
+            .parse_response(
+                payload.as_slice(),
+                crate::constants::ccap_value::FIELD_VERSION_19_1,
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidCredentials));
+        assert!(!format!("{error:?} {error}").contains("private server"));
     }
 }

@@ -259,6 +259,13 @@ fn prepare_identity(
     input: &InputConfig,
     query_fingerprint: ConfigurationFingerprint,
 ) -> Result<PreparedIdentity, DaemonError> {
+    if input.connector == "oracle" && matches!(&input.mode, CollectionMode::Rising(_)) {
+        return Err(preparation_error(
+            "DBX-RS-PREP-0007",
+            "cursor_configuration",
+            "Oracle rising collection is not supported",
+        ));
+    }
     match &input.mode {
         CollectionMode::Batch => {
             let input_id = batch_input_id(&input.name)?;
@@ -867,6 +874,33 @@ source = private:source
 
         assert_eq!(implicit, explicit);
         assert!(implicit.rising.is_none());
+    }
+
+    #[test]
+    fn oracle_batch_prepares_without_cursor_state() {
+        let mut configured = input(QuerySource::Inline("SELECT 1 FROM DUAL".into()), None);
+        configured.connector = "oracle".into();
+        configured.port = 1521;
+        configured.database = "ORCLPDB1".into();
+
+        let prepared = prepare_input(&configured, &hec()).expect("Oracle batch must prepare");
+
+        assert_eq!(prepared.connector, "oracle");
+        assert_eq!(prepared.connection.connector_id, "oracle");
+        assert!(prepared.rising.is_none());
+    }
+
+    #[test]
+    fn oracle_rising_fails_closed_during_daemon_preparation() {
+        let (mut configured, hec) = parsed_rising_input();
+        configured.connector = "oracle".into();
+
+        let error = prepare_input(&configured, &hec)
+            .expect_err("Oracle rising must not create prepared cursor state");
+
+        assert_eq!(error.code(), "DBX-RS-PREP-0007");
+        assert_eq!(error.stage(), "cursor_configuration");
+        assert!(error.configuration_error());
     }
 
     #[test]

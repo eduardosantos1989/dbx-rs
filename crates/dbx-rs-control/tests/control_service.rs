@@ -27,6 +27,7 @@ impl Fixture {
         for path in [
             app_home.join("default"),
             app_home.join("local"),
+            app_home.join("queries/oracle"),
             app_home.join("queries/psql"),
             splunk_home.join("var/log/splunk"),
             splunk_home.join("var/run/splunk/dbx-rs"),
@@ -90,6 +91,35 @@ fn named_validation_checks_assets_and_existing_secret_without_disclosure() {
     let trace = fixture.trace();
     assert!(trace.contains("\"component\":\"dbx_rs_control\""));
     assert!(trace.contains("\"operation\":\"input_validate\""));
+    assert!(!trace.contains(QUERY_MARKER));
+    assert!(!trace.contains(SECRET_MARKER));
+}
+
+#[test]
+fn named_validation_accepts_oracle_batch_without_disclosure() {
+    let fixture = Fixture::new(Some("warehouse"));
+    let configured = input_config("warehouse")
+        .replace("connector = postgres", "connector = oracle")
+        .replace("port = 5432", "port = 1521")
+        .replace("database = telemetry", "database = ORCLPDB1")
+        .replace(
+            &format!("query = SELECT '{QUERY_MARKER}' AS marker"),
+            &format!("query = SELECT '{QUERY_MARKER}' AS marker FROM DUAL"),
+        );
+    fs::write(
+        fixture.app_home.join("default/dbxrs_inputs.conf"),
+        configured,
+    )
+    .expect("Oracle input configuration must be written");
+
+    let response = fixture
+        .service()
+        .validate_input("warehouse")
+        .expect("Oracle validation operation must complete");
+
+    assert!(response.valid);
+    assert_eq!(response.connector, "oracle");
+    let trace = fixture.trace();
     assert!(!trace.contains(QUERY_MARKER));
     assert!(!trace.contains(SECRET_MARKER));
 }
@@ -234,6 +264,40 @@ async fn query_file_parent_symlink_cannot_escape_the_asset_root() {
         .expect_err("query path through escaping parent symlink must be rejected");
 
     assert_eq!(error.code(), "DBX-RS-CONTROL-0004");
+}
+
+#[tokio::test]
+async fn oracle_query_file_uses_only_the_oracle_asset_root() {
+    let fixture = Fixture::new(Some("warehouse"));
+    let configured = input_config("warehouse")
+        .replace("connector = postgres", "connector = oracle")
+        .replace("port = 5432", "port = 1521")
+        .replace("database = telemetry", "database = ORCLPDB1");
+    fs::write(
+        fixture.app_home.join("default/dbxrs_inputs.conf"),
+        configured,
+    )
+    .expect("Oracle input configuration must be written");
+    let wrong_root = fixture.app_home.join("queries/psql/rejected.sql");
+    let approved = fixture.app_home.join("queries/oracle/rejected.sql");
+    fs::write(&wrong_root, "DELETE FROM private_table").expect("wrong-root query must be written");
+    fs::write(&approved, "DELETE FROM private_table").expect("approved-root query must be written");
+    let service = fixture.service();
+
+    let root_error = service
+        .test_query(query_file_request(wrong_root), CancellationToken::new())
+        .await
+        .expect_err("PostgreSQL query root must fail for Oracle");
+    let query_error = service
+        .test_query(query_file_request(approved), CancellationToken::new())
+        .await
+        .expect_err("write query must fail before Oracle network access");
+
+    assert_eq!(root_error.code(), "DBX-RS-CONTROL-0004");
+    assert_eq!(query_error.code(), "DBX-RS-ORA-CFG-0017");
+    let trace = fixture.trace();
+    assert!(!trace.contains("private_table"));
+    assert!(!trace.contains(SECRET_MARKER));
 }
 
 fn query_file_request(path: PathBuf) -> QueryTestRequest {

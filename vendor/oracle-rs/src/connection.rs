@@ -43,6 +43,7 @@ use crate::cursor::{ScrollableCursor, ScrollResult};
 use crate::error::{Error, Result};
 use crate::implicit::{ImplicitResult, ImplicitResults};
 use crate::messages::{
+    parse_error_info_with_rowcount_for_version,
     AcceptMessage, AuthMessage, AuthPhase, ConnectMessage, ExecuteMessage, ExecuteOptions,
     FetchMessage, LobOpMessage, NON_PIPELINED_TOKEN_NUMBER, validate_response_token,
     write_request_token,
@@ -247,6 +248,25 @@ enum OracleStream {
     Plain(TcpStream),
     /// TLS-encrypted connection
     Tls(TlsOracleStream),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectResendAction {
+    Replay,
+    RenegotiateTls,
+}
+
+fn connect_resend_action(tls_enabled: bool, packet_flags: u8) -> Result<ConnectResendAction> {
+    if packet_flags & crate::constants::packet_flags::TLS_RENEG == 0 {
+        return Ok(ConnectResendAction::Replay);
+    }
+    if tls_enabled {
+        Ok(ConnectResendAction::RenegotiateTls)
+    } else {
+        Err(Error::ProtocolError(
+            "Server requested TLS renegotiation on a plaintext connection".to_string(),
+        ))
+    }
 }
 
 impl OracleStream {
@@ -929,7 +949,8 @@ impl Connection {
         // Both conditions must be met - server must have indicated OOB support in ACCEPT
         let needs_oob_check = {
             let inner = self.inner.lock().await;
-            inner.server_info.protocol_version >= crate::constants::version::MIN_OOB_CHECK
+            !self.config.is_tls_enabled()
+                && inner.server_info.protocol_version >= crate::constants::version::MIN_OOB_CHECK
                 && inner.server_info.supports_oob
         };
         if needs_oob_check {
@@ -1063,6 +1084,11 @@ impl Connection {
                             "Server requested too many resends during connect".to_string(),
                         ));
                     }
+                    if connect_resend_action(self.config.is_tls_enabled(), response[5])?
+                        == ConnectResendAction::RenegotiateTls
+                    {
+                        self.renegotiate_tls_transport(&mut inner).await?;
+                    }
                     inner.send(&connect_packet).await?;
                     if let Some(ref data_packet) = continuation {
                         inner.send(data_packet).await?;
@@ -1074,6 +1100,33 @@ impl Connection {
                         packet_type,
                     )));
                 }
+            }
+        }
+    }
+
+    async fn renegotiate_tls_transport(&self, inner: &mut ConnectionInner) -> Result<()> {
+        let stream = inner.stream.take().ok_or(Error::ConnectionClosed)?;
+        let tcp_stream = match stream {
+            OracleStream::Tls(stream) => stream.into_tcp_stream(),
+            stream @ OracleStream::Plain(_) => {
+                inner.stream = Some(stream);
+                return Err(Error::ProtocolError(
+                    "TLS renegotiation requested without an active TLS stream".to_string(),
+                ));
+            }
+        };
+        let tls_config = self.config.tls_config.as_ref()
+            .cloned()
+            .unwrap_or_else(TlsConfig::new);
+
+        match connect_tls(tcp_stream, &self.config.host, &tls_config).await {
+            Ok(stream) => {
+                inner.stream = Some(OracleStream::Tls(stream));
+                Ok(())
+            }
+            Err(error) => {
+                inner.state = ConnectionState::Closed;
+                Err(error)
             }
         }
     }
@@ -1174,7 +1227,10 @@ impl Connection {
                 }
             }
 
-            auth.parse_response(&response[PACKET_HEADER_SIZE..])?;
+            auth.parse_response(
+                &response[PACKET_HEADER_SIZE..],
+                inner.capabilities.ttc_field_version,
+            )?;
         }
 
         // Phase two: send encrypted password
@@ -1203,7 +1259,10 @@ impl Connection {
                 }
             }
 
-            auth.parse_response(&response[PACKET_HEADER_SIZE..])?;
+            auth.parse_response(
+                &response[PACKET_HEADER_SIZE..],
+                inner.capabilities.ttc_field_version,
+            )?;
         }
 
         // Verify authentication completed
@@ -1217,6 +1276,13 @@ impl Connection {
         let mut inner = self.inner.lock().await;
         if let Some(combo_key) = auth.combo_key() {
             inner.capabilities.combo_key = Some(combo_key.to_vec());
+        }
+        if let Some(version) = auth.database_version(inner.capabilities.ttc_field_version) {
+            inner.server_info.version = version;
+        }
+        if let Some(identity) = auth.session_identity() {
+            inner.server_info.session_id = identity.session_id;
+            inner.server_info.serial_number = u32::from(identity.serial_number);
         }
         // Auth used sequence numbers 1 and 2, set to 2 so next is 3
         inner.sequence_number = 2;
@@ -1916,7 +1982,7 @@ impl Connection {
 
         let mut inner = self.inner.lock().await;
         fetch_msg.set_sequence_number(inner.next_sequence_number());
-        let request = fetch_msg.build_request(&inner.capabilities)?;
+        let request = fetch_msg.build_request_with_sdu(&inner.capabilities, inner.large_sdu)?;
         inner.send(&request).await?;
 
         self.receive_query_result_with_previous(&mut inner, columns, previous_row)
@@ -3876,103 +3942,7 @@ impl Connection {
         buf: &mut ReadBuffer,
         ttc_field_version: u8,
     ) -> Result<(u32, Option<String>, u16, u64)> {
-        // End of call status
-        let _call_status = buf.read_ub4()?;
-        // End to end seq#
-        buf.skip_ub2()?;
-        // Current row number
-        buf.skip_ub4()?;
-        // Error number (short form)
-        buf.skip_ub2()?;
-        // Array elem error
-        buf.skip_ub2()?;
-        // Array elem error
-        buf.skip_ub2()?;
-        // Cursor ID
-        let cursor_id = buf.read_ub2()?;
-        // Error position
-        let _error_pos = buf.read_sb2()?;
-        // SQL type (19c and earlier)
-        buf.skip_ub1()?;
-        // Fatal?
-        buf.skip_ub1()?;
-        // Flags
-        buf.skip_ub1()?;
-        // User cursor options
-        buf.skip_ub1()?;
-        // UPI parameter
-        buf.skip_ub1()?;
-        // Flags (second)
-        buf.skip_ub1()?;
-        // Rowid (rba, partition_id, skip 1, block_num, slot_num)
-        buf.skip_ub4()?; // rba
-        buf.skip_ub2()?; // partition_id
-        buf.skip_ub1()?; // skip
-        buf.skip_ub4()?; // block_num
-        buf.skip_ub2()?; // slot_num
-        // OS error
-        buf.skip_ub4()?;
-        // Statement number
-        buf.skip_ub1()?;
-        // Call number
-        buf.skip_ub1()?;
-        // Padding
-        buf.skip_ub2()?;
-        // Success iters
-        buf.skip_ub4()?;
-        // oerrdd (logical rowid)
-        let oerrdd_len = buf.read_ub4()?;
-        if oerrdd_len > 0 {
-            buf.skip_raw_bytes_chunked()?;
-        }
-
-        // Batch error codes array
-        let num_batch_errors = buf.read_ub2()?;
-        if num_batch_errors > 0 {
-            buf.skip_ub1()?;  // first byte
-            for _ in 0..num_batch_errors {
-                buf.skip_ub2()?;  // error code
-            }
-        }
-
-        // Batch error row offset array
-        let num_offsets = buf.read_ub4()?;
-        if num_offsets > 0 {
-            buf.skip_ub1()?;  // first byte
-            for _ in 0..num_offsets {
-                buf.skip_ub4()?;  // offset
-            }
-        }
-
-        // Batch error messages array
-        let num_batch_msgs = buf.read_ub2()?;
-        if num_batch_msgs > 0 {
-            buf.skip_ub1()?;  // packed size
-            for _ in 0..num_batch_msgs {
-                buf.skip_ub2()?;  // chunk length
-                buf.read_string_with_length()?;  // message
-                buf.skip(2)?;  // end marker
-            }
-        }
-
-        // Extended error number (UB4)
-        let error_code = buf.read_ub4()?;
-        // Row count (UB8) - this is the rows affected!
-        let row_count = buf.read_ub8()?;
-
-        if ttc_field_version >= crate::constants::ccap_value::FIELD_VERSION_20_1 {
-            buf.skip_ub4()?; // sql_type
-            buf.skip_ub4()?; // server_checksum
-        }
-
-        // Error message
-        let error_msg = if error_code != 0 {
-            buf.read_string_with_length()?.map(|s| s.trim().to_string())
-        } else {
-            None
-        };
-
-        Ok((error_code, error_msg, cursor_id, row_count))
+        parse_error_info_with_rowcount_for_version(buf, ttc_field_version)
     }
 
     /// Parse describe info from response to extract column metadata
@@ -5648,6 +5618,26 @@ mod tests {
             closed: AtomicBool::new(false),
             id: 1,
         }
+    }
+
+    #[test]
+    fn tls_resend_requests_a_fresh_tls_handshake() {
+        assert_eq!(
+            connect_resend_action(true, crate::constants::packet_flags::TLS_RENEG).unwrap(),
+            ConnectResendAction::RenegotiateTls
+        );
+        assert_eq!(
+            connect_resend_action(true, 0).unwrap(),
+            ConnectResendAction::Replay
+        );
+    }
+
+    #[test]
+    fn plaintext_resend_rejects_a_tls_renegotiation_flag() {
+        assert!(matches!(
+            connect_resend_action(false, crate::constants::packet_flags::TLS_RENEG),
+            Err(Error::ProtocolError(_))
+        ));
     }
 
     fn success_error_info(ttc_field_version: u8) -> Vec<u8> {

@@ -256,7 +256,7 @@ impl ControlService {
             Err(error) => issues.push(issue_from_error(
                 &error,
                 "tls_ca_file",
-                "configured PostgreSQL TLS material could not be loaded",
+                "configured database TLS material could not be loaded",
             )),
         }
 
@@ -265,7 +265,7 @@ impl ControlService {
             Err(error) => issues.push(issue_from_error(
                 &error,
                 "query",
-                "configured PostgreSQL query could not be loaded",
+                "configured database query could not be loaded",
             )),
         }
 
@@ -693,6 +693,7 @@ fn issue_from_error(error: &ControlError, field: &str, message: &str) -> Validat
 
 fn query_namespace(connector: &str) -> &'static str {
     match connector {
+        "oracle" => "oracle",
         "postgres" => "psql",
         _ => "unsupported",
     }

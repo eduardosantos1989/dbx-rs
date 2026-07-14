@@ -611,8 +611,11 @@ fn parse_input(
 ) -> Result<InputConfig, ConfigError> {
     let mode = parse_collection_mode(ini, name)?;
     let connector = required_label(ini, name, "connector")?;
-    if connector != "postgres" {
+    if !matches!(connector.as_str(), "oracle" | "postgres") {
         return Err(ConfigError::new("DBX-RS-CFG-0014", "input.connector"));
+    }
+    if connector == "oracle" && matches!(&mode, CollectionMode::Rising(_)) {
+        return Err(ConfigError::new("DBX-RS-CFG-0061", "input.mode"));
     }
     let max_rows = required_u64(ini, name, "max_rows")?;
     if !(1..=HARD_INPUT_ROWS).contains(&max_rows) {
@@ -846,6 +849,7 @@ fn parse_query_source(
 
 fn query_namespace(connector: &str) -> &'static str {
     match connector {
+        "oracle" => "oracle",
         "postgres" => "psql",
         _ => "unsupported",
     }
@@ -1158,6 +1162,16 @@ source = dbx_rs:heartbeat
         )
     }
 
+    fn oracle_input_config() -> String {
+        input_config()
+            .replace("connector = postgres", "connector = oracle")
+            .replace("port = 5432", "port = 1521")
+            .replace("database = events", "database = ORCLPDB1")
+            .replace("certs/psql/", "certs/oracle/")
+            .replace("queries/psql/", "queries/oracle/")
+            .replace("dbx_rs:postgres:heartbeat", "dbx_rs:oracle:heartbeat")
+    }
+
     #[test]
     fn loads_typed_defaults_and_local_override() {
         let (root, app) = fixture();
@@ -1185,6 +1199,63 @@ source = dbx_rs:heartbeat
                 .get(),
             4
         );
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn loads_oracle_batch_with_connector_asset_roots() {
+        let (root, app) = fixture();
+        fs::write(app.join("default").join(INPUTS_FILE), oracle_input_config())
+            .expect("Oracle input fixture must be written");
+
+        let effective = load_effective_config(&app, &root).expect("Oracle batch input must load");
+        let input = &effective.inputs[0];
+
+        assert_eq!(input.connector, "oracle");
+        assert_eq!(input.mode, CollectionMode::Batch);
+        assert!(
+            input
+                .tls_ca_file
+                .as_ref()
+                .is_some_and(|path| path.starts_with(app.join("certs/oracle")))
+        );
+        assert!(matches!(
+            &input.query,
+            QuerySource::File(path) if path.starts_with(app.join("queries/oracle"))
+        ));
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_oracle_rising_mode() {
+        let (root, app) = fixture();
+        let configured = oracle_input_config().replace(
+            "disabled = false",
+            "disabled = false\nmode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\ncursor_timestamp_field = updated_at\ncursor_id_field = id",
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), configured)
+            .expect("Oracle rising fixture must be written");
+
+        let error =
+            load_effective_config(&app, &root).expect_err("Oracle rising input must fail closed");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0061");
+        assert_eq!(error.field(), "input.mode");
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_postgres_asset_roots_for_oracle() {
+        let (root, app) = fixture();
+        let configured = oracle_input_config().replace("queries/oracle/", "queries/psql/");
+        fs::write(app.join("default").join(INPUTS_FILE), configured)
+            .expect("wrong Oracle query root fixture must be written");
+
+        let error = load_effective_config(&app, &root)
+            .expect_err("Oracle query in PostgreSQL root must fail");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0048");
+        assert_eq!(error.field(), "query_file");
         fs::remove_dir_all(root).expect("fixture must be removed");
     }
 

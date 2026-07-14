@@ -62,6 +62,15 @@ impl FetchMessage {
 
     /// Build the fetch request packet
     pub fn build_request(&self, caps: &Capabilities) -> Result<Bytes> {
+        self.build_request_with_sdu(caps, false)
+    }
+
+    /// Build the fetch request packet with the negotiated SDU header format.
+    pub fn build_request_with_sdu(
+        &self,
+        caps: &Capabilities,
+        large_sdu: bool,
+    ) -> Result<Bytes> {
         let mut buf = WriteBuffer::new();
 
         // Write message header
@@ -82,13 +91,17 @@ impl FetchMessage {
 
         // Build packet with header
         let payload = buf.freeze();
-        let packet_len = PACKET_HEADER_SIZE + payload.len();
+        let packet_len = PACKET_HEADER_SIZE + 2 + payload.len();
 
         let mut packet = BytesMut::with_capacity(packet_len);
 
         // Packet header
-        packet.put_u16(packet_len as u16); // Length
-        packet.put_u16(0); // Checksum
+        if large_sdu {
+            packet.put_u32(packet_len as u32);
+        } else {
+            packet.put_u16(packet_len as u16);
+            packet.put_u16(0); // Checksum
+        }
         packet.put_u8(PacketType::Data as u8);
         packet.put_u8(0); // Flags
         packet.put_u16(0); // Header checksum
@@ -134,6 +147,7 @@ mod tests {
 
         // Check packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);
+        assert_eq!(u16::from_be_bytes(packet[..2].try_into().unwrap()) as usize, packet.len());
         assert_eq!(packet[4], PacketType::Data as u8);
 
         // Check data flags are present
@@ -173,5 +187,16 @@ mod tests {
         assert_eq!(payload.read_ub4().unwrap(), 3);
         assert_eq!(payload.read_ub4().unwrap(), 25);
         assert_eq!(payload.remaining(), 0);
+    }
+
+    #[test]
+    fn fetch_uses_four_byte_length_for_large_sdu() {
+        let msg = FetchMessage::new(3, 25);
+        let caps = Capabilities::new();
+
+        let packet = msg.build_request_with_sdu(&caps, true).unwrap();
+
+        assert_eq!(u32::from_be_bytes(packet[..4].try_into().unwrap()), packet.len() as u32);
+        assert_eq!(packet[4], PacketType::Data as u8);
     }
 }

@@ -273,6 +273,12 @@ impl TlsOracleStream {
     pub fn into_inner(self) -> TlsStream<TcpStream> {
         self.inner
     }
+
+    /// Consume the TLS session without closing the underlying TCP stream.
+    pub(crate) fn into_tcp_stream(self) -> TcpStream {
+        let (stream, _session) = self.inner.into_inner();
+        stream
+    }
 }
 
 impl AsyncRead for TlsOracleStream {

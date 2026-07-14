@@ -1,0 +1,1 @@
+SELECT SYSDATE AS collected_at FROM DUAL

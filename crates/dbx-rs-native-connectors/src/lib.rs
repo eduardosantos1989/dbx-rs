@@ -10,6 +10,7 @@ use arrow_array::{
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Schema, TimeUnit};
+use dbx_rs_connector_oracle::OracleConnector;
 use dbx_rs_connector_postgres::PostgresConnector;
 use dbx_rs_connector_sdk::{
     ArrowIpcBatch, CollectionResult, Connector, ConnectorDescriptor, ConnectorError,
@@ -34,9 +35,10 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(1);
 const MAX_COLLECTION_TIMEOUT: Duration = Duration::from_hours(24);
 const IPC_END_MARKER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 
-/// Registry for Native Certified connectors linked into this process.
+/// Registry for native connectors linked into this process.
 #[derive(Clone)]
 pub struct NativeConnectorProvider {
+    oracle: Arc<OracleConnector>,
     postgres: Arc<PostgresConnector>,
 }
 
@@ -47,6 +49,7 @@ impl NativeConnectorProvider {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            oracle: Arc::new(OracleConnector::new()),
             postgres: Arc::new(PostgresConnector),
         }
     }
@@ -200,6 +203,7 @@ async fn collect_json_rows_inner(
     deadline: Instant,
     cancellation: CancellationToken,
 ) -> Result<CollectionResult, ConnectorError> {
+    let binary_json_encoding = binary_json_encoding(&request.connection.connector_id)?;
     let prepared = connector
         .prepare(
             PrepareRequest {
@@ -241,6 +245,7 @@ async fn collect_json_rows_inner(
             expected_schema: prepared.schema,
             limits,
             max_output_bytes: request.max_bytes,
+            binary_json_encoding,
             cursor: request.cursor.clone(),
             cancellation: cancellation.child_token(),
         },
@@ -289,6 +294,7 @@ impl Default for NativeConnectorProvider {
 impl ConnectorProvider for NativeConnectorProvider {
     fn connector(&self, connector_id: &str) -> Result<Arc<dyn Connector>, ConnectorError> {
         match connector_id {
+            OracleConnector::CONNECTOR_ID => Ok(self.oracle.clone()),
             PostgresConnector::CONNECTOR_ID => Ok(self.postgres.clone()),
             _ => Err(error(
                 "DBX-RS-NATIVE-CONNECTOR-0001",
@@ -300,7 +306,7 @@ impl ConnectorProvider for NativeConnectorProvider {
     }
 
     fn descriptors(&self) -> Vec<ConnectorDescriptor> {
-        vec![self.postgres.descriptor()]
+        vec![self.oracle.descriptor(), self.postgres.descriptor()]
     }
 }
 
@@ -531,6 +537,7 @@ struct MaterializationOptions {
     expected_schema: QuerySchema,
     limits: ExecutionLimits,
     max_output_bytes: u64,
+    binary_json_encoding: BinaryJsonEncoding,
     cursor: Option<TimestampIdCursorRequest>,
     cancellation: CancellationToken,
 }
@@ -545,6 +552,7 @@ async fn materialize_batches(
         expected_schema,
         limits,
         max_output_bytes,
+        binary_json_encoding,
         cursor,
         cancellation,
     } = options;
@@ -565,6 +573,7 @@ async fn materialize_batches(
         expected_schema: &expected_schema,
         limits,
         max_output_bytes,
+        binary_json_encoding,
         row_tx: &row_tx,
         cancellation: &cancellation,
     };
@@ -607,6 +616,7 @@ struct MaterializationContext<'a> {
     expected_schema: &'a QuerySchema,
     limits: ExecutionLimits,
     max_output_bytes: u64,
+    binary_json_encoding: BinaryJsonEncoding,
     row_tx: &'a mpsc::Sender<JsonRow>,
     cancellation: &'a CancellationToken,
 }
@@ -699,7 +709,7 @@ async fn materialize_and_send_row(
     result: &mut MaterializedResult,
     context: &MaterializationContext<'_>,
 ) -> Result<(), ConnectorError> {
-    let line = materialize_row(batch, schema, row)?;
+    let line = materialize_row(batch, schema, row, context.binary_json_encoding)?;
     let line_bytes = u64::try_from(line.len()).map_err(|_| {
         conversion_error(
             "DBX-RS-NATIVE-LIMIT-0003",
@@ -1068,6 +1078,7 @@ fn materialize_row(
     batch: &RecordBatch,
     schema: &QuerySchema,
     row: usize,
+    binary_json_encoding: BinaryJsonEncoding,
 ) -> Result<Vec<u8>, ConnectorError> {
     let mut output = Vec::new();
     output.push(b'{');
@@ -1077,7 +1088,13 @@ fn materialize_row(
         }
         write_json(&mut output, &field.name)?;
         output.push(b':');
-        write_field_value(&mut output, batch.column(index).as_ref(), field, row)?;
+        write_field_value(
+            &mut output,
+            batch.column(index).as_ref(),
+            field,
+            row,
+            binary_json_encoding,
+        )?;
     }
     output.push(b'}');
     Ok(output)
@@ -1088,6 +1105,7 @@ fn write_field_value(
     array: &dyn Array,
     field: &FieldDescriptor,
     row: usize,
+    binary_json_encoding: BinaryJsonEncoding,
 ) -> Result<(), ConnectorError> {
     if array.is_null(row) {
         output.extend_from_slice(b"null");
@@ -1123,7 +1141,10 @@ fn write_field_value(
             write_array_value::<StringArray, _>(array, row, |a, r| write_json(output, a.value(r)))
         }
         FieldType::Binary => write_array_value::<BinaryArray, _>(array, row, |a, r| {
-            write_json(output, &postgres_binary(a.value(r)))
+            write_json(
+                output,
+                &encode_binary_json(a.value(r), binary_json_encoding),
+            )
         }),
         FieldType::Json => write_array_value::<StringArray, _>(array, row, |a, r| {
             let raw = RawValue::from_string(a.value(r).to_owned()).map_err(|_| {
@@ -1209,11 +1230,31 @@ fn write_finite_float(output: &mut Vec<u8>, value: f64) -> Result<(), ConnectorE
     write_json(output, &value)
 }
 
-fn postgres_binary(bytes: &[u8]) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BinaryJsonEncoding {
+    PostgresByteaHex,
+    TaggedHex,
+}
+
+fn binary_json_encoding(connector_id: &str) -> Result<BinaryJsonEncoding, ConnectorError> {
+    match connector_id {
+        PostgresConnector::CONNECTOR_ID => Ok(BinaryJsonEncoding::PostgresByteaHex),
+        OracleConnector::CONNECTOR_ID => Ok(BinaryJsonEncoding::TaggedHex),
+        _ => Err(configuration_error(
+            "DBX-RS-NATIVE-CFG-0007",
+            "binary JSON encoding is unavailable for the connector",
+        )),
+    }
+}
+
+fn encode_binary_json(bytes: &[u8], encoding: BinaryJsonEncoding) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(2 + bytes.len().saturating_mul(2));
-    encoded.push('\\');
-    encoded.push('x');
+    let prefix = match encoding {
+        BinaryJsonEncoding::PostgresByteaHex => "\\x",
+        BinaryJsonEncoding::TaggedHex => "hex:",
+    };
+    let mut encoded = String::with_capacity(prefix.len() + bytes.len().saturating_mul(2));
+    encoded.push_str(prefix);
     for byte in bytes {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
@@ -1403,6 +1444,7 @@ mod tests {
             expected_schema: schema,
             limits: materialization_limits(max_rows),
             max_output_bytes,
+            binary_json_encoding: BinaryJsonEncoding::PostgresByteaHex,
             cursor,
             cancellation,
         }
@@ -1752,7 +1794,22 @@ mod tests {
         assert_eq!(format_decimal(-1, 2), "-0.01");
         assert_eq!(format_decimal(12, -2), "1200");
         assert_eq!(format_decimal(i128::MIN, 0), i128::MIN.to_string());
-        assert_eq!(postgres_binary(&[0, 0xaf, 0xff]), "\\x00afff");
+        assert_eq!(
+            encode_binary_json(&[0, 0xaf, 0xff], BinaryJsonEncoding::PostgresByteaHex),
+            "\\x00afff"
+        );
+        assert_eq!(
+            encode_binary_json(&[0, 0xaf, 0xff], BinaryJsonEncoding::TaggedHex),
+            "hex:00afff"
+        );
+        assert_eq!(
+            binary_json_encoding(PostgresConnector::CONNECTOR_ID).unwrap(),
+            BinaryJsonEncoding::PostgresByteaHex
+        );
+        assert_eq!(
+            binary_json_encoding(OracleConnector::CONNECTOR_ID).unwrap(),
+            BinaryJsonEncoding::TaggedHex
+        );
     }
 
     #[test]
@@ -1819,7 +1876,8 @@ mod tests {
         .expect("test batch must be valid");
         let encoded = encode_batch(&batch);
         let decoded = decode_one_batch(&encoded, &schema).expect("IPC must decode");
-        let line = materialize_row(&decoded, &schema, 0).expect("row must materialize");
+        let line = materialize_row(&decoded, &schema, 0, BinaryJsonEncoding::PostgresByteaHex)
+            .expect("row must materialize");
 
         assert_eq!(
             String::from_utf8(line).expect("JSON output must be UTF-8"),
@@ -1841,8 +1899,13 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["not-json"]))],
         )
         .expect("test batch must be valid");
-        let json_error =
-            materialize_row(&json_batch, &json_schema, 0).expect_err("invalid JSON must fail");
+        let json_error = materialize_row(
+            &json_batch,
+            &json_schema,
+            0,
+            BinaryJsonEncoding::PostgresByteaHex,
+        )
+        .expect_err("invalid JSON must fail");
         assert_eq!(json_error.code(), "DBX-RS-NATIVE-CONVERT-0003");
 
         let float_schema = QuerySchema {
@@ -1857,8 +1920,13 @@ mod tests {
             vec![Arc::new(Float64Array::from(vec![f64::NAN]))],
         )
         .expect("test batch must be valid");
-        let float_error = materialize_row(&float_batch, &float_schema, 0)
-            .expect_err("non-finite float must fail");
+        let float_error = materialize_row(
+            &float_batch,
+            &float_schema,
+            0,
+            BinaryJsonEncoding::PostgresByteaHex,
+        )
+        .expect_err("non-finite float must fail");
         assert_eq!(float_error.code(), "DBX-RS-NATIVE-CONVERT-0002");
     }
 
@@ -2172,5 +2240,37 @@ mod tests {
         assert_eq!(error.class(), ErrorClass::Configuration);
         assert!(error.is_configuration_error());
         assert!(!error.message().contains("unknown"));
+    }
+
+    #[test]
+    fn registered_descriptors_are_ordered_and_report_support_tiers() {
+        let provider = NativeConnectorProvider::new();
+        let descriptors = provider.descriptors();
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].connector_id, OracleConnector::CONNECTOR_ID);
+        assert_eq!(
+            descriptors[0].support_tier,
+            ConnectorSupportTier::ExperimentalNative
+        );
+        assert_eq!(descriptors[1].connector_id, PostgresConnector::CONNECTOR_ID);
+        assert_eq!(
+            descriptors[1].support_tier,
+            ConnectorSupportTier::NativeCertified
+        );
+        assert_eq!(
+            provider
+                .connector(OracleConnector::CONNECTOR_ID)
+                .unwrap()
+                .descriptor(),
+            descriptors[0]
+        );
+        assert_eq!(
+            provider
+                .connector(PostgresConnector::CONNECTOR_ID)
+                .unwrap()
+                .descriptor(),
+            descriptors[1]
+        );
     }
 }

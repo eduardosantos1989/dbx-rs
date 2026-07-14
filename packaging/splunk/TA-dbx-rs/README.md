@@ -21,11 +21,20 @@ not implemented, so do not change an established rising identity. Rising base qu
 contain `LIMIT`, `OFFSET`, or `FETCH`; connector preparation rejects those clauses so the daemon
 owns the complete outer cursor scan and page limit.
 
-Put PostgreSQL query files in `queries/psql/` and PostgreSQL CA bundles in `certs/psql/`. Input
-stanzas may instead use `query = ...` for short inline SQL, but `query` and `query_file` are mutually
-exclusive. The daemon reads these assets but does not create or rewrite them. Installation-specific
-query and certificate files are ignored by the public source tree and must be supplied by an
-approved package, deployment server, deployer, or future UI workflow.
+Oracle is available as Experimental Native in batch mode only. Oracle rising stanzas fail
+configuration and daemon-preparation validation; one successful 19c compatibility target does not
+make the connector Native Certified.
+
+Put PostgreSQL query files in `queries/psql/` and PostgreSQL CA bundles in `certs/psql/`. Put Oracle
+query files in `queries/oracle/` and Oracle CA bundles in `certs/oracle/`. Input stanzas may instead
+use `query = ...` for short inline SQL, but `query` and `query_file` are mutually exclusive. The
+daemon reads these assets but does not create or rewrite them. Installation-specific query and
+certificate files are ignored by the public source tree and must be supplied by an approved
+package, deployment server, deployer, or future UI workflow.
+
+PostgreSQL bytea keeps its existing lowercase `\\x`-prefixed hexadecimal JSON representation.
+Oracle RAW is rendered losslessly as a lowercase `hex:`-prefixed JSON string. No connector-specific
+database type escapes the native connector boundary.
 
 Validate the effective layered configuration without starting the daemon:
 
@@ -172,6 +181,11 @@ only after the scan is complete, the full receipt prefix is durable, and the coo
 that every page crossed the configured HEC boundary. An empty final page completes the scan without
 advancing beyond the greatest candidate already sealed. These rules preserve recovery safety but do
 not remove at-least-once replay at the HEC boundary.
+
+Oracle batch inputs use the same encrypted spool, deterministic batch event identity, HEC ACK, and
+ready-segment replay path. Roll back Oracle collection by disabling its stanza, stopping new work,
+and draining or deliberately retaining ready segments before removing Oracle-enabled binaries or
+assets. Do not delete ready segments as part of rollback.
 
 The spool and checkpoint formats are persistent. To roll back, stop the daemon and preserve the
 complete spool root, spool key, `state_dir`, and state-root binding marker as one matched set. New
