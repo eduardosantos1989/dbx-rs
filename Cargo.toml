@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "connectors/oracle",
     "connectors/postgres",
     "crates/dbx-rs-checkpoint",
     "crates/dbx-rs-cli",
@@ -14,6 +15,7 @@ members = [
     "crates/dbx-rs-telemetry",
 ]
 resolver = "3"
+exclude = ["vendor/oracle-rs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,6 +40,7 @@ dbx-rs-state = { version = "0.1.0", path = "crates/dbx-rs-state" }
 dbx-rs-telemetry = { version = "0.1.0", path = "crates/dbx-rs-telemetry" }
 futures-util = { version = "0.3.32", default-features = false }
 http = { version = "1.4.2", default-features = false }
+oracle-rs = { version = "=0.1.7-dbx.1", path = "vendor/oracle-rs" }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
 ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }

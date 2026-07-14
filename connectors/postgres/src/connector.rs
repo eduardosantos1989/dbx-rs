@@ -2,10 +2,11 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use dbx_rs_connector_sdk::{
     AuthenticationMethod, CONNECTOR_CONTRACT_VERSION, ConnectionConfig, Connector,
-    ConnectorCapability, ConnectorDescriptor, ConnectorError, ConnectorFuture, ErrorClass,
-    ExecuteRequest, ExecutionResult, PrepareRequest, PreparedQuery, ProbeReport, ProbeRequest,
-    ResolvedSecret, TimestampIdCursorBound, TimestampIdCursorRequest, TlsMode, ValidationIssue,
-    ValidationReport, ValidationRequest, ValidationSeverity,
+    ConnectorCapability, ConnectorDescriptor, ConnectorError, ConnectorFuture,
+    ConnectorSupportTier, ErrorClass, ExecuteRequest, ExecutionResult, PrepareRequest,
+    PreparedQuery, ProbeReport, ProbeRequest, ResolvedSecret, TimestampIdCursorBound,
+    TimestampIdCursorRequest, TlsMode, ValidationIssue, ValidationReport, ValidationRequest,
+    ValidationSeverity,
 };
 use rustls::{
     ClientConfig, RootCertStore,
@@ -43,6 +44,7 @@ impl PostgresConnector {
             ],
             authentication_methods: vec![AuthenticationMethod::Password],
             build_id: format!("{}-{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            support_tier: ConnectorSupportTier::NativeCertified,
         }
     }
 

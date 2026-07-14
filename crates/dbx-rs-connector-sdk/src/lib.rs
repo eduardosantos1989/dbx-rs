@@ -8,9 +8,10 @@ mod secret;
 
 pub use contract::{
     ArrowIpcBatch, AuthenticationMethod, CONNECTOR_CONTRACT_VERSION, Connector,
-    ConnectorCapability, ConnectorDescriptor, ConnectorFuture, ConnectorProvider, ExecuteRequest,
-    ExecutionLimits, ExecutionResult, FieldDescriptor, FieldType, PrepareRequest, PreparedQuery,
-    ProbeRequest, ProtocolVersion, QuerySchema, QueryText, ValidationRequest,
+    ConnectorCapability, ConnectorDescriptor, ConnectorFuture, ConnectorProvider,
+    ConnectorSupportTier, ExecuteRequest, ExecutionLimits, ExecutionResult, FieldDescriptor,
+    FieldType, PrepareRequest, PreparedQuery, ProbeRequest, ProtocolVersion, QuerySchema,
+    QueryText, ValidationRequest,
 };
 pub use cursor::{
     CursorContractError, CursorNullPolicy, TIMESTAMP_ID_CURSOR_CANONICAL_BYTES,

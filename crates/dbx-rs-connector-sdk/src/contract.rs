@@ -43,6 +43,15 @@ pub enum AuthenticationMethod {
     Token,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorSupportTier {
+    #[default]
+    NativeCertified,
+    ExperimentalNative,
+    ManagedCompatibility,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectorDescriptor {
     pub contract_version: ProtocolVersion,
@@ -52,6 +61,8 @@ pub struct ConnectorDescriptor {
     pub capabilities: Vec<ConnectorCapability>,
     pub authentication_methods: Vec<AuthenticationMethod>,
     pub build_id: String,
+    #[serde(default)]
+    pub support_tier: ConnectorSupportTier,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -290,8 +301,29 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_one_two() {
+    fn protocol_version_remains_one_two() {
         assert_eq!(CONNECTOR_CONTRACT_VERSION, ProtocolVersion::new(1, 2));
+    }
+
+    #[test]
+    fn legacy_descriptor_defaults_to_native_certified() {
+        let descriptor: ConnectorDescriptor = serde_json::from_str(
+            r#"{
+                "contract_version":{"major":1,"minor":2},
+                "connector_id":"postgres",
+                "connector_version":"0.1.0",
+                "database_families":["postgresql"],
+                "capabilities":["validate_configuration"],
+                "authentication_methods":["password"],
+                "build_id":"legacy"
+            }"#,
+        )
+        .expect("contract 1.2 descriptor should deserialize");
+
+        assert_eq!(
+            descriptor.support_tier,
+            ConnectorSupportTier::NativeCertified
+        );
     }
 
     #[test]

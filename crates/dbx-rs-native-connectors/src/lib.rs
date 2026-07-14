@@ -1353,8 +1353,8 @@ mod tests {
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::Field;
     use dbx_rs_connector_sdk::{
-        CONNECTOR_CONTRACT_VERSION, ConnectionConfig, ConnectorFuture, CursorNullPolicy,
-        FieldDescriptor, TimestampIdCursorSpec, TlsMode,
+        CONNECTOR_CONTRACT_VERSION, ConnectionConfig, ConnectorFuture, ConnectorSupportTier,
+        CursorNullPolicy, FieldDescriptor, TimestampIdCursorSpec, TlsMode,
     };
 
     fn connection() -> ConnectionConfig {
@@ -1493,6 +1493,7 @@ mod tests {
                 capabilities: Vec::new(),
                 authentication_methods: Vec::new(),
                 build_id: "test".into(),
+                support_tier: ConnectorSupportTier::NativeCertified,
             }
         }
 

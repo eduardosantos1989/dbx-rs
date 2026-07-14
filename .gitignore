@@ -1,4 +1,6 @@
 /target/
+/vendor/oracle-rs/target/
+/vendor/oracle-rs/Cargo.lock
 /.idea/
 /.vscode/
 /docs/*
