@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "connectors/mysql",
     "connectors/oracle",
     "connectors/postgres",
     "crates/dbx-rs-checkpoint",
@@ -40,6 +41,12 @@ dbx-rs-state = { version = "0.1.0", path = "crates/dbx-rs-state" }
 dbx-rs-telemetry = { version = "0.1.0", path = "crates/dbx-rs-telemetry" }
 futures-util = { version = "0.3.32", default-features = false }
 http = { version = "1.4.2", default-features = false }
+mysql_async = { version = "=0.37.0", default-features = false, features = [
+    "minimal-rust",
+    "ring",
+    "rustls-tls",
+    "tls12",
+] }
 oracle-rs = { version = "=0.1.7-dbx.1", path = "vendor/oracle-rs" }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
 ring = { version = "0.17.14", default-features = false, features = ["alloc", "std"] }

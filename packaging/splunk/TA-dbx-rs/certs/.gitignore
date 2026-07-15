@@ -1,5 +1,7 @@
 /*
 !/.gitignore
 !/README.txt
+!/mariadb/
+!/mysql/
 !/oracle/
 !/psql/

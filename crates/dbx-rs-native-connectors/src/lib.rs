@@ -10,6 +10,7 @@ use arrow_array::{
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Schema, TimeUnit};
+use dbx_rs_connector_mysql::{MariaDbConnector, MySqlConnector};
 use dbx_rs_connector_oracle::OracleConnector;
 use dbx_rs_connector_postgres::PostgresConnector;
 use dbx_rs_connector_sdk::{
@@ -38,6 +39,8 @@ const IPC_END_MARKER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 /// Registry for native connectors linked into this process.
 #[derive(Clone)]
 pub struct NativeConnectorProvider {
+    mariadb: Arc<MariaDbConnector>,
+    mysql: Arc<MySqlConnector>,
     oracle: Arc<OracleConnector>,
     postgres: Arc<PostgresConnector>,
 }
@@ -49,6 +52,8 @@ impl NativeConnectorProvider {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            mariadb: Arc::new(MariaDbConnector),
+            mysql: Arc::new(MySqlConnector),
             oracle: Arc::new(OracleConnector::new()),
             postgres: Arc::new(PostgresConnector),
         }
@@ -294,6 +299,8 @@ impl Default for NativeConnectorProvider {
 impl ConnectorProvider for NativeConnectorProvider {
     fn connector(&self, connector_id: &str) -> Result<Arc<dyn Connector>, ConnectorError> {
         match connector_id {
+            MariaDbConnector::CONNECTOR_ID => Ok(self.mariadb.clone()),
+            MySqlConnector::CONNECTOR_ID => Ok(self.mysql.clone()),
             OracleConnector::CONNECTOR_ID => Ok(self.oracle.clone()),
             PostgresConnector::CONNECTOR_ID => Ok(self.postgres.clone()),
             _ => Err(error(
@@ -306,7 +313,12 @@ impl ConnectorProvider for NativeConnectorProvider {
     }
 
     fn descriptors(&self) -> Vec<ConnectorDescriptor> {
-        vec![self.oracle.descriptor(), self.postgres.descriptor()]
+        vec![
+            self.mariadb.descriptor(),
+            self.mysql.descriptor(),
+            self.oracle.descriptor(),
+            self.postgres.descriptor(),
+        ]
     }
 }
 
@@ -1239,7 +1251,9 @@ enum BinaryJsonEncoding {
 fn binary_json_encoding(connector_id: &str) -> Result<BinaryJsonEncoding, ConnectorError> {
     match connector_id {
         PostgresConnector::CONNECTOR_ID => Ok(BinaryJsonEncoding::PostgresByteaHex),
-        OracleConnector::CONNECTOR_ID => Ok(BinaryJsonEncoding::TaggedHex),
+        MariaDbConnector::CONNECTOR_ID
+        | MySqlConnector::CONNECTOR_ID
+        | OracleConnector::CONNECTOR_ID => Ok(BinaryJsonEncoding::TaggedHex),
         _ => Err(configuration_error(
             "DBX-RS-NATIVE-CFG-0007",
             "binary JSON encoding is unavailable for the connector",
@@ -1810,6 +1824,14 @@ mod tests {
             binary_json_encoding(OracleConnector::CONNECTOR_ID).unwrap(),
             BinaryJsonEncoding::TaggedHex
         );
+        assert_eq!(
+            binary_json_encoding(MySqlConnector::CONNECTOR_ID).unwrap(),
+            BinaryJsonEncoding::TaggedHex
+        );
+        assert_eq!(
+            binary_json_encoding(MariaDbConnector::CONNECTOR_ID).unwrap(),
+            BinaryJsonEncoding::TaggedHex
+        );
     }
 
     #[test]
@@ -2247,30 +2269,54 @@ mod tests {
         let provider = NativeConnectorProvider::new();
         let descriptors = provider.descriptors();
 
-        assert_eq!(descriptors.len(), 2);
-        assert_eq!(descriptors[0].connector_id, OracleConnector::CONNECTOR_ID);
+        assert_eq!(descriptors.len(), 4);
+        assert_eq!(descriptors[0].connector_id, MariaDbConnector::CONNECTOR_ID);
         assert_eq!(
             descriptors[0].support_tier,
             ConnectorSupportTier::ExperimentalNative
         );
-        assert_eq!(descriptors[1].connector_id, PostgresConnector::CONNECTOR_ID);
+        assert_eq!(descriptors[1].connector_id, MySqlConnector::CONNECTOR_ID);
         assert_eq!(
             descriptors[1].support_tier,
+            ConnectorSupportTier::ExperimentalNative
+        );
+        assert_eq!(descriptors[2].connector_id, OracleConnector::CONNECTOR_ID);
+        assert_eq!(
+            descriptors[2].support_tier,
+            ConnectorSupportTier::ExperimentalNative
+        );
+        assert_eq!(descriptors[3].connector_id, PostgresConnector::CONNECTOR_ID);
+        assert_eq!(
+            descriptors[3].support_tier,
             ConnectorSupportTier::NativeCertified
         );
         assert_eq!(
             provider
-                .connector(OracleConnector::CONNECTOR_ID)
+                .connector(MariaDbConnector::CONNECTOR_ID)
                 .unwrap()
                 .descriptor(),
             descriptors[0]
         );
         assert_eq!(
             provider
-                .connector(PostgresConnector::CONNECTOR_ID)
+                .connector(MySqlConnector::CONNECTOR_ID)
                 .unwrap()
                 .descriptor(),
             descriptors[1]
+        );
+        assert_eq!(
+            provider
+                .connector(OracleConnector::CONNECTOR_ID)
+                .unwrap()
+                .descriptor(),
+            descriptors[2]
+        );
+        assert_eq!(
+            provider
+                .connector(PostgresConnector::CONNECTOR_ID)
+                .unwrap()
+                .descriptor(),
+            descriptors[3]
         );
     }
 }

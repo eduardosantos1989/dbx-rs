@@ -4,8 +4,8 @@ disabled = <boolean>
 
 mode = batch | rising
 * Optional collection mode. Omitted mode defaults to batch for existing stanzas.
-* Rising mode is supported only by PostgreSQL and uses a durable TIMESTAMPTZ-plus-BIGINT cursor.
-  Oracle is batch-only. Batch stanzas must not configure any rising-only settings below.
+* Rising mode is supported by PostgreSQL, MySQL, and MariaDB. Oracle is batch-only. Batch stanzas
+  must not configure any rising-only settings below.
 * A rising scan collects, seals, reconciles, and delivers one bounded page at a time. Every
   non-empty page is an authenticated durable spool segment before HEC delivery can begin. Startup
   reconciles sealed-page recovery metadata before replay or another page is collected.
@@ -26,8 +26,9 @@ input_id = <canonical lowercase UUID>
 cursor_timestamp_field = <query output field>
 cursor_id_field = <query output field>
 * Required only for rising mode. The configured query must expose these distinct exact output
-  aliases once, as non-NULL PostgreSQL TIMESTAMPTZ and BIGINT values respectively. Names are limited
-  to 63 UTF-8 bytes and cannot contain control characters.
+  aliases once. PostgreSQL requires non-NULL TIMESTAMPTZ and BIGINT; MySQL and MariaDB require
+  non-NULL TIMESTAMP and signed BIGINT. Names are limited to 63 UTF-8 bytes and cannot contain
+  control characters.
 * The timestamp-plus-ID tuple must uniquely identify each source row. NULL cursor values, duplicate
   tuples, and ordering regressions fail the page without advancing the checkpoint.
 * The configured query is a parameter-free SELECT or WITH base query. dbx-rs owns the outer cursor
@@ -47,9 +48,10 @@ cursor_overlap_secs = <non-negative integer>
 * Splunk can still receive the same identity more than once under at-least-once delivery when a HEC
   acceptance or acknowledgment outcome is uncertain. Use dbxrs_event_id for downstream dedupe.
 
-connector = postgres | oracle
-* Native connector identifier. PostgreSQL is Native Certified. Oracle is Experimental Native and
-  supports batch mode only.
+connector = postgres | oracle | mysql | mariadb
+* Native connector identifier. PostgreSQL is Native Certified. Oracle, MySQL, and MariaDB are
+  Experimental Native. Oracle supports batch mode only; MySQL and MariaDB have offline-tested batch
+  and rising implementations but still require separate live product certification.
 
 interval_secs = <positive integer>
 * Delay from one completed collection to the next run.
@@ -74,13 +76,13 @@ tls_server_name = <DNS name>
 
 tls_ca_file = <absolute path>
 * Optional PEM CA bundle. Supports an initial $SPLUNK_HOME/ path component.
-* PostgreSQL certificate files must resolve below certs/psql. Oracle certificate files must resolve
-  below certs/oracle.
+* Certificate files must resolve below the selected product root: certs/psql, certs/oracle,
+  certs/mysql, or certs/mariadb.
 
 query_file = <absolute path>
 * UTF-8 SELECT or WITH query file. SQL is not written to operational logs.
-* PostgreSQL query files must resolve below queries/psql. Oracle query files must resolve below
-  queries/oracle.
+* Query files must resolve below the selected product root: queries/psql, queries/oracle,
+  queries/mysql, or queries/mariadb.
 
 query = <SQL text>
 * Inline SELECT or WITH query for short definitions.
@@ -100,7 +102,7 @@ max_bytes = <positive integer>
   reports input.spool_bound.
 * Hard maximum: 1073741824 unencoded row bytes per batch run or rising query page.
 * PostgreSQL bytea retains its existing lowercase \\x-prefixed hexadecimal JSON string. Oracle RAW
-  is emitted losslessly as a lowercase hex:-prefixed JSON string.
+  and MySQL-family binary values are emitted losslessly as lowercase hex:-prefixed JSON strings.
 
 index = <label>
 sourcetype = <label>

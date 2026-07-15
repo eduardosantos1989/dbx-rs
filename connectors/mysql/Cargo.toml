@@ -1,0 +1,24 @@
+[package]
+name = "dbx-rs-connector-mysql"
+description = "Experimental native MySQL and MariaDB connectors for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+dbx-rs-connector-sdk.workspace = true
+futures-util.workspace = true
+mysql_async.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

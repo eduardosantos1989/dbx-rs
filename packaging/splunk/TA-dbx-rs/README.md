@@ -14,27 +14,40 @@ encrypted spool quotas, and HEC transport settings. Put overrides in `local/dbxr
 `default/dbxrs_inputs.conf` is intentionally empty. Put database stanzas in
 `local/dbxrs_inputs.conf`; see `README/dbxrs_inputs.conf.example` and the `.conf.spec` files. A
 stanza references a credential by `local:<name>`. Plaintext password, secret, token, and connection
-string settings are rejected. Omitted `mode` defaults to `batch`. PostgreSQL `rising` mode requires
-an immutable, unique, non-nil `input_id` and distinct timestamp and integer cursor aliases; see the
-input specification before enabling a rising stanza. Identity migration and checkpoint reset are
-not implemented, so do not change an established rising identity. Rising base queries cannot
-contain `LIMIT`, `OFFSET`, or `FETCH`; connector preparation rejects those clauses so the daemon
-owns the complete outer cursor scan and page limit.
+string settings are rejected. Omitted `mode` defaults to `batch`. PostgreSQL, MySQL, and MariaDB
+`rising` modes require an immutable, unique, non-nil `input_id` and distinct timestamp and integer
+cursor aliases; see the input specification before enabling a rising stanza. Identity migration
+and checkpoint reset are not implemented, so do not change an established rising identity. Rising
+base queries cannot contain their own pagination; connector preparation rejects those clauses so
+the daemon owns the complete outer cursor scan and page limit.
 
 Oracle is available as Experimental Native in batch mode only. Oracle rising stanzas fail
 configuration and daemon-preparation validation; one successful 19c compatibility target does not
 make the connector Native Certified.
 
-Put PostgreSQL query files in `queries/psql/` and PostgreSQL CA bundles in `certs/psql/`. Put Oracle
-query files in `queries/oracle/` and Oracle CA bundles in `certs/oracle/`. Input stanzas may instead
+MySQL and MariaDB are distinct Experimental Native connectors with offline-tested batch and rising
+implementations. They share a pure-Rust protocol crate but reject a server identified as the other
+product. Their TLS, exact-type, rising, cancellation, and Splunk delivery/recovery gates have not
+yet run against authorized live hosts, so neither connector is Native Certified or operationally
+certified.
+
+Use a dedicated least-privilege database identity limited to the required read queries and metadata.
+Do not grant `FILE`, sequence-write, plugin/UDF installation, or database-administration privileges.
+The connector rejects known write, lock, file, sequence, and external-execution forms and runs user
+queries in a read-only transaction, but it cannot infer the behavior of an arbitrary server-installed
+UDF from its name.
+
+Put connector assets in their product-specific roots: PostgreSQL uses `queries/psql/` and
+`certs/psql/`, Oracle uses `queries/oracle/` and `certs/oracle/`, MySQL uses `queries/mysql/` and
+`certs/mysql/`, and MariaDB uses `queries/mariadb/` and `certs/mariadb/`. Input stanzas may instead
 use `query = ...` for short inline SQL, but `query` and `query_file` are mutually exclusive. The
 daemon reads these assets but does not create or rewrite them. Installation-specific query and
 certificate files are ignored by the public source tree and must be supplied by an approved
 package, deployment server, deployer, or future UI workflow.
 
 PostgreSQL bytea keeps its existing lowercase `\\x`-prefixed hexadecimal JSON representation.
-Oracle RAW is rendered losslessly as a lowercase `hex:`-prefixed JSON string. No connector-specific
-database type escapes the native connector boundary.
+Oracle RAW and MySQL-family binary values are rendered losslessly as lowercase `hex:`-prefixed JSON
+strings. No connector-specific database type escapes the native connector boundary.
 
 Validate the effective layered configuration without starting the daemon:
 
@@ -168,12 +181,13 @@ canonical cursor tuple, so overlap reads, page retries, and restarts retain the 
 Downstream searches can use this field to identify replay duplicates without changing the database
 row.
 
-For PostgreSQL rising inputs, the daemon creates an active attempt and durable scan before page
-collection. The connector binds the committed and scan-resume positions as native parameters and
-returns an uncommitted checkpoint candidate plus a distinct resume cursor. Each non-empty bounded
-page is sealed with authenticated recovery metadata before it is referenced by checkpoint state.
-Startup reconciliation validates that metadata against the input identity, configuration fence,
-attempt, page, cursor contract, and requested bounds before adopting or replaying the segment.
+For PostgreSQL, MySQL, and MariaDB rising inputs, the daemon creates an active attempt and durable
+scan before page collection. The selected connector binds the committed and scan-resume positions
+as native parameters and returns an uncommitted checkpoint candidate plus a distinct resume cursor.
+Each non-empty bounded page is sealed with authenticated recovery metadata before it is referenced
+by checkpoint state. Startup reconciliation validates that metadata against the input identity,
+configuration fence, attempt, page, cursor contract, and requested bounds before adopting or
+replaying the segment.
 
 The checkpoint repository records delivery as an exact sequential prefix, one segment at a time.
 A receipted segment is compacted without being resent during recovery. The committed cursor advances
@@ -186,6 +200,11 @@ Oracle batch inputs use the same encrypted spool, deterministic batch event iden
 ready-segment replay path. Roll back Oracle collection by disabling its stanza, stopping new work,
 and draining or deliberately retaining ready segments before removing Oracle-enabled binaries or
 assets. Do not delete ready segments as part of rollback.
+
+MySQL and MariaDB inputs use those same host-owned batch/rising delivery boundaries. Roll back one
+by disabling its stanzas, stopping new work, and draining or deliberately retaining ready segments
+before removing its connector-enabled binaries or assets. Preserve rising checkpoint state with
+the matched spool and keys; deleting retained data is not a rollback procedure.
 
 The spool and checkpoint formats are persistent. To roll back, stop the daemon and preserve the
 complete spool root, spool key, `state_dir`, and state-root binding marker as one matched set. New
@@ -201,8 +220,8 @@ configured spool segment; lower those limits or raise the bounded segment limit 
 
 ## Query-path upgrade and rollback
 
-Before upgrading an existing input, move its PostgreSQL query file from `local/` to `queries/psql/`
-and its database CA bundle from `local/` to `certs/psql/`, preserving ownership and permissions, then
+Before upgrading an existing input, move its query file and database CA bundle from `local/` to the
+selected connector roots under `queries/` and `certs/`, preserving ownership and permissions, then
 update both paths in `local/dbxrs_inputs.conf`. To roll back to a binary that permits the older
 layout, move the files back and restore the prior paths. A configuration that uses inline `query`
 must first be converted to a query file because older binaries do not recognize that setting.

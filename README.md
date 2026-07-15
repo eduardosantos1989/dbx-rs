@@ -25,8 +25,15 @@ generate and reconcile a stable local HEC token and certificate without Splunk m
 credentials. Daemon and connector operations emit versioned, redacted NDJSON lifecycle metrics
 with epoch timestamps to Splunk's `dbx-trace.log`.
 
+Oracle is registered as an Experimental Native batch connector. Distinct MySQL and MariaDB
+Experimental Native connectors now implement offline-tested configuration, product detection,
+verified Rustls TLS, prepared typed Arrow streaming, and `TIMESTAMP`-plus-signed-`BIGINT` rising
+queries through a shared pure-Rust protocol crate. They reject cross-product selection and
+unsupported or lossy types. No authorized MySQL, MariaDB, or current Splunk target was available
+for this slice, so their product-specific live and end-to-end delivery gates remain unproven.
+
 The `dbx-rs` administrative CLI now exposes typed JSON operations for validating one named input,
-probing its configured PostgreSQL connection, and running a tightly bounded read-only query test.
+probing its configured connector, and running a tightly bounded read-only query test.
 Inline test SQL is read only from standard input, while file tests are restricted to the app's
 connector-specific query directory. These operations share serializable service DTOs intended for
 a future authenticated REST layer; no REST listener is currently exposed. The connector contract is
@@ -34,12 +41,12 @@ currently an in-process boundary. The framed worker transport remains a later im
 
 A serializable checkpoint coordinator models independent collection and delivery completion,
 stale-generation fencing, replay recovery, and delivery-gated cursor commit. The scheduled daemon
-supports both batch stanzas and PostgreSQL rising stanzas with an immutable input UUID and a typed
-`TIMESTAMPTZ`-plus-`BIGINT` cursor. Every active rising attempt has a durable scan, and each
-non-empty page is authenticated and sealed in the spool before its reference is appended to the
-scan. Startup reconciliation can adopt a sealed page, resume collection, persist one sequential
-delivery receipt at a time, compact receipted segments, and finish an empty final page without
-inventing a cursor.
+supports batch stanzas for every registered connector and rising stanzas for PostgreSQL, MySQL, and
+MariaDB with an immutable input UUID and typed timestamp-plus-integer cursor. Every active rising
+attempt has a durable scan, and each non-empty page is authenticated and sealed in the spool before
+its reference is appended to the scan. Startup reconciliation can adopt a sealed page, resume
+collection, persist one sequential delivery receipt at a time, compact receipted segments, and
+finish an empty final page without inventing a cursor.
 
 A rising checkpoint advances only after collection is complete, every sealed page has crossed the
 configured HEC boundary, the complete delivery-receipt prefix is durable, and the coordinator has

@@ -57,7 +57,11 @@ jobs:
 
       - name: Verify packaged connector asset roots
         run: |
+          test -f packaging/splunk/TA-dbx-rs/certs/mariadb/.gitignore
+          test -f packaging/splunk/TA-dbx-rs/certs/mysql/.gitignore
           test -f packaging/splunk/TA-dbx-rs/certs/oracle/.gitignore
+          test -f packaging/splunk/TA-dbx-rs/queries/mariadb/example.sql
+          test -f packaging/splunk/TA-dbx-rs/queries/mysql/example.sql
           test -f packaging/splunk/TA-dbx-rs/queries/oracle/example.sql
 
       - name: Install pinned Rust toolchain and target
@@ -68,10 +72,28 @@ jobs:
       - name: Build release artifacts
         run: cargo build --release --target x86_64-unknown-linux-musl --workspace --all-features
 
-      - name: Verify Oracle is linked into shipped runtimes
+      - name: Verify native drivers are linked into shipped runtimes
         run: |
           cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-cli -i oracle-rs | grep -Fq dbx-rs-cli
           cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-daemon -i oracle-rs | grep -Fq dbx-rs-daemon
+          cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-cli -i mysql_async | grep -Fq dbx-rs-cli
+          cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-daemon -i mysql_async | grep -Fq dbx-rs-daemon
+
+      - name: Verify MySQL-family pure-Rust dependency profile
+        shell: bash
+        run: |
+          tree="$(cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-connector-mysql)"
+          if grep -Eq '(^| )((libz|openssl)-sys|native-tls) v' <<<"$tree"; then
+            echo "MySQL-family connector selected a forbidden native dependency"
+            exit 1
+          fi
+          features="$(cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-connector-mysql -e features)"
+          grep -Fq 'mysql_async feature "minimal-rust"' <<<"$features"
+          grep -Fq 'mysql_async feature "rustls-tls"' <<<"$features"
+          if grep -Fq 'mysql_async feature "tracing"' <<<"$features"; then
+            echo "MySQL-family connector enabled SQL/parameter tracing"
+            exit 1
+          fi
 
       - name: Verify static Linux linkage
         shell: bash

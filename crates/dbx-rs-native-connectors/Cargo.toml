@@ -11,6 +11,7 @@ publish = false
 arrow-array.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
+dbx-rs-connector-mysql = { version = "0.1.0", path = "../../connectors/mysql" }
 dbx-rs-connector-oracle = { version = "0.1.0", path = "../../connectors/oracle" }
 dbx-rs-connector-postgres = { version = "0.1.0", path = "../../connectors/postgres" }
 dbx-rs-connector-sdk.workspace = true

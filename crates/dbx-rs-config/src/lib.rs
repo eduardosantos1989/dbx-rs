@@ -611,7 +611,10 @@ fn parse_input(
 ) -> Result<InputConfig, ConfigError> {
     let mode = parse_collection_mode(ini, name)?;
     let connector = required_label(ini, name, "connector")?;
-    if !matches!(connector.as_str(), "oracle" | "postgres") {
+    if !matches!(
+        connector.as_str(),
+        "mariadb" | "mysql" | "oracle" | "postgres"
+    ) {
         return Err(ConfigError::new("DBX-RS-CFG-0014", "input.connector"));
     }
     if connector == "oracle" && matches!(&mode, CollectionMode::Rising(_)) {
@@ -849,6 +852,8 @@ fn parse_query_source(
 
 fn query_namespace(connector: &str) -> &'static str {
     match connector {
+        "mariadb" => "mariadb",
+        "mysql" => "mysql",
         "oracle" => "oracle",
         "postgres" => "psql",
         _ => "unsupported",
@@ -1172,6 +1177,18 @@ source = dbx_rs:heartbeat
             .replace("dbx_rs:postgres:heartbeat", "dbx_rs:oracle:heartbeat")
     }
 
+    fn mysql_family_input_config(connector: &str) -> String {
+        input_config()
+            .replace("connector = postgres", &format!("connector = {connector}"))
+            .replace("port = 5432", "port = 3306")
+            .replace("certs/psql/", &format!("certs/{connector}/"))
+            .replace("queries/psql/", &format!("queries/{connector}/"))
+            .replace(
+                "dbx_rs:postgres:heartbeat",
+                &format!("dbx_rs:{connector}:heartbeat"),
+            )
+    }
+
     #[test]
     fn loads_typed_defaults_and_local_override() {
         let (root, app) = fixture();
@@ -1223,6 +1240,95 @@ source = dbx_rs:heartbeat
             &input.query,
             QuerySource::File(path) if path.starts_with(app.join("queries/oracle"))
         ));
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn loads_mysql_and_mariadb_rising_with_distinct_asset_roots() {
+        for connector in ["mysql", "mariadb"] {
+            let (root, app) = fixture();
+            let configured = mysql_family_input_config(connector).replace(
+                "disabled = false",
+                "disabled = false\nmode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\ncursor_timestamp_field = updated_at\ncursor_id_field = id",
+            );
+            fs::write(app.join("default").join(INPUTS_FILE), configured)
+                .expect("MySQL-family fixture must be written");
+
+            let effective =
+                load_effective_config(&app, &root).expect("MySQL-family rising input must load");
+            let input = &effective.inputs[0];
+
+            assert_eq!(input.connector, connector);
+            assert!(matches!(input.mode, CollectionMode::Rising(_)));
+            assert!(
+                input
+                    .tls_ca_file
+                    .as_ref()
+                    .is_some_and(|path| path.starts_with(app.join(format!("certs/{connector}"))))
+            );
+            assert!(matches!(
+                &input.query,
+                QuerySource::File(path)
+                    if path.starts_with(app.join(format!("queries/{connector}")))
+            ));
+            fs::remove_dir_all(root).expect("fixture must be removed");
+        }
+    }
+
+    #[test]
+    fn shipped_examples_parse_with_product_specific_modes_and_asset_roots() {
+        let (root, app) = fixture();
+        fs::write(
+            app.join("default").join(INPUTS_FILE),
+            include_str!("../../../packaging/splunk/TA-dbx-rs/README/dbxrs_inputs.conf.example"),
+        )
+        .expect("shipped input examples must be written");
+
+        let effective =
+            load_effective_config(&app, &root).expect("shipped input examples must parse");
+
+        assert_eq!(effective.inputs.len(), 7);
+        assert!(effective.inputs.iter().all(|input| input.disabled));
+        for connector in ["mysql", "mariadb"] {
+            let product_inputs = effective
+                .inputs
+                .iter()
+                .filter(|input| input.connector == connector)
+                .collect::<Vec<_>>();
+            assert_eq!(product_inputs.len(), 2);
+            assert!(
+                product_inputs
+                    .iter()
+                    .any(|input| matches!(input.mode, CollectionMode::Batch))
+            );
+            assert!(
+                product_inputs
+                    .iter()
+                    .any(|input| matches!(input.mode, CollectionMode::Rising(_)))
+            );
+            assert!(product_inputs.iter().all(|input| match &input.query {
+                QuerySource::Inline(_) => true,
+                QuerySource::File(path) => {
+                    path.starts_with(app.join(format!("queries/{connector}")))
+                }
+            }));
+        }
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
+    fn rejects_cross_product_mysql_family_asset_roots() {
+        let (root, app) = fixture();
+        let configured =
+            mysql_family_input_config("mysql").replace("queries/mysql/", "queries/mariadb/");
+        fs::write(app.join("default").join(INPUTS_FILE), configured)
+            .expect("wrong product query root fixture must be written");
+
+        let error =
+            load_effective_config(&app, &root).expect_err("cross-product query root must fail");
+
+        assert_eq!(error.code(), "DBX-RS-CFG-0048");
+        assert_eq!(error.field(), "query_file");
         fs::remove_dir_all(root).expect("fixture must be removed");
     }
 

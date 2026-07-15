@@ -27,6 +27,8 @@ impl Fixture {
         for path in [
             app_home.join("default"),
             app_home.join("local"),
+            app_home.join("queries/mariadb"),
+            app_home.join("queries/mysql"),
             app_home.join("queries/oracle"),
             app_home.join("queries/psql"),
             splunk_home.join("var/log/splunk"),
@@ -122,6 +124,42 @@ fn named_validation_accepts_oracle_batch_without_disclosure() {
     let trace = fixture.trace();
     assert!(!trace.contains(QUERY_MARKER));
     assert!(!trace.contains(SECRET_MARKER));
+}
+
+#[test]
+fn named_validation_accepts_mysql_and_mariadb_rising_without_disclosure() {
+    for connector in ["mysql", "mariadb"] {
+        let fixture = Fixture::new(Some("warehouse"));
+        let configured = input_config("warehouse")
+            .replace("connector = postgres", &format!("connector = {connector}"))
+            .replace("port = 5432", "port = 3306")
+            .replace(
+                "disabled = false\n",
+                "disabled = false\nmode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\ncursor_timestamp_field = updated_at\ncursor_id_field = id\n",
+            )
+            .replace(
+                &format!("query = SELECT '{QUERY_MARKER}' AS marker"),
+                &format!(
+                    "query = SELECT updated_at, id, '{QUERY_MARKER}' AS marker FROM events"
+                ),
+            );
+        fs::write(
+            fixture.app_home.join("default/dbxrs_inputs.conf"),
+            configured,
+        )
+        .expect("MySQL-family input configuration must be written");
+
+        let response = fixture
+            .service()
+            .validate_input("warehouse")
+            .expect("MySQL-family validation operation must complete");
+
+        assert!(response.valid);
+        assert_eq!(response.connector, connector);
+        let trace = fixture.trace();
+        assert!(!trace.contains(QUERY_MARKER));
+        assert!(!trace.contains(SECRET_MARKER));
+    }
 }
 
 #[test]
@@ -298,6 +336,47 @@ async fn oracle_query_file_uses_only_the_oracle_asset_root() {
     let trace = fixture.trace();
     assert!(!trace.contains("private_table"));
     assert!(!trace.contains(SECRET_MARKER));
+}
+
+#[tokio::test]
+async fn mysql_family_query_files_use_only_the_selected_product_root() {
+    for (connector, wrong_connector) in [("mysql", "mariadb"), ("mariadb", "mysql")] {
+        let fixture = Fixture::new(Some("warehouse"));
+        let configured = input_config("warehouse")
+            .replace("connector = postgres", &format!("connector = {connector}"))
+            .replace("port = 5432", "port = 3306");
+        fs::write(
+            fixture.app_home.join("default/dbxrs_inputs.conf"),
+            configured,
+        )
+        .expect("MySQL-family input configuration must be written");
+        let wrong_root = fixture
+            .app_home
+            .join(format!("queries/{wrong_connector}/rejected.sql"));
+        let approved = fixture
+            .app_home
+            .join(format!("queries/{connector}/rejected.sql"));
+        fs::write(&wrong_root, "DELETE FROM private_table")
+            .expect("wrong-root query must be written");
+        fs::write(&approved, "DELETE FROM private_table")
+            .expect("approved-root query must be written");
+        let service = fixture.service();
+
+        let root_error = service
+            .test_query(query_file_request(wrong_root), CancellationToken::new())
+            .await
+            .expect_err("cross-product query root must fail");
+        let query_error = service
+            .test_query(query_file_request(approved), CancellationToken::new())
+            .await
+            .expect_err("write query must fail before MySQL-family network access");
+
+        assert_eq!(root_error.code(), "DBX-RS-CONTROL-0004");
+        assert_eq!(query_error.code(), "DBX-RS-MY-CFG-0017");
+        let trace = fixture.trace();
+        assert!(!trace.contains("private_table"));
+        assert!(!trace.contains(SECRET_MARKER));
+    }
 }
 
 fn query_file_request(path: PathBuf) -> QueryTestRequest {

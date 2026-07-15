@@ -904,6 +904,39 @@ source = private:source
     }
 
     #[test]
+    fn mysql_and_mariadb_batch_and_rising_prepare_distinct_connector_state() {
+        for connector in ["mysql", "mariadb"] {
+            let mut batch = input(QuerySource::Inline("SELECT 1".into()), None);
+            batch.connector = connector.into();
+            batch.port = 3306;
+            let prepared_batch =
+                prepare_input(&batch, &hec()).expect("MySQL-family batch must prepare");
+
+            assert_eq!(prepared_batch.connector, connector);
+            assert_eq!(prepared_batch.connection.connector_id, connector);
+            assert!(prepared_batch.rising.is_none());
+
+            let (mut rising, rising_hec) = parsed_rising_input();
+            rising.connector = connector.into();
+            rising.port = 3306;
+            let prepared_rising = prepare_input(&rising, &rising_hec)
+                .expect("MySQL-family rising input must prepare");
+
+            assert_eq!(prepared_rising.connector, connector);
+            assert_eq!(prepared_rising.connection.connector_id, connector);
+            assert_eq!(
+                prepared_rising
+                    .rising
+                    .as_ref()
+                    .expect("rising state must exist")
+                    .cursor_spec
+                    .timestamp_field,
+                "private_updated_at"
+            );
+        }
+    }
+
+    #[test]
     fn batch_v1_identity_and_fingerprints_have_stable_vectors() {
         let prepared = prepare_input(&input(QuerySource::Inline("SELECT 1".into()), None), &hec())
             .expect("batch input must prepare");

@@ -17,6 +17,7 @@ allow = [
     "ISC",
     "MIT",
     "Unicode-3.0",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
@@ -24,9 +25,15 @@ confidence-threshold = 0.8
 multiple-versions = "deny"
 wildcards = "deny"
 skip = [
+    { crate = "block-buffer@0.10.4", reason = "mysql_common 0.37 uses the RustCrypto 0.10 authentication stack while the existing connectors use 0.11" },
     { crate = "const-oid@0.9.6", reason = "tokio-postgres-rustls uses x509-cert on const-oid 0.9 while postgres-protocol uses digest on const-oid 0.10" },
+    { crate = "cpufeatures@0.2.17", reason = "mysql_common 0.37 uses the RustCrypto 0.10 authentication stack while the existing connectors use 0.11" },
+    { crate = "crypto-common@0.1.7", reason = "mysql_common 0.37 uses the RustCrypto 0.10 authentication stack while the existing connectors use 0.11" },
+    { crate = "digest@0.10.7", reason = "mysql_common 0.37 uses the RustCrypto 0.10 authentication stack while the existing connectors use 0.11" },
     { crate = "getrandom@0.2.17", reason = "Rustls ring uses getrandom 0.2 while tokio-postgres uses rand on getrandom 0.4" },
     { crate = "getrandom@0.3.4", reason = "Arrow ahash uses getrandom 0.3 while Rustls ring and tokio-postgres use getrandom 0.2 and 0.4" },
+    { crate = "sha1@0.10.7", reason = "mysql_common 0.37 uses the RustCrypto 0.10 authentication stack while the existing connectors use 0.11" },
+    { crate = "sha2@0.10.9", reason = "mysql_common 0.37 uses the RustCrypto 0.10 authentication stack while the existing connectors use 0.11" },
 ]
 
 [sources]
