@@ -844,6 +844,24 @@ fn protocol_error(code: &'static str, message: &'static str) -> ConnectorError {
     ConnectorError::new(code, ErrorClass::Protocol, message, false, false)
 }
 
+fn contains_rustls_error(error: &std::io::Error) -> bool {
+    let Some(inner) = error.get_ref() else {
+        return false;
+    };
+    if inner.is::<rustls::Error>() {
+        return true;
+    }
+
+    let mut source = inner.source();
+    while let Some(current) = source {
+        if current.is::<rustls::Error>() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
 fn classify_connect_error(error: &MySqlError, tls_mode: TlsMode) -> ConnectorError {
     match error {
         MySqlError::Server(server) if is_authentication_error(server) => ConnectorError::new(
@@ -863,6 +881,13 @@ fn classify_connect_error(error: &MySqlError, tls_mode: TlsMode) -> ConnectorErr
         )
         .with_sql_state(server.state.clone()),
         MySqlError::Io(IoError::Tls(_)) => ConnectorError::new(
+            "DBX-RS-MY-TLS-0001",
+            ErrorClass::Tls,
+            "MySQL-family TLS verification or negotiation failed",
+            false,
+            false,
+        ),
+        MySqlError::Io(IoError::Io(error)) if contains_rustls_error(error) => ConnectorError::new(
             "DBX-RS-MY-TLS-0001",
             ErrorClass::Tls,
             "MySQL-family TLS verification or negotiation failed",
@@ -919,6 +944,13 @@ pub(super) fn classify_query_error(error: &MySqlError) -> ConnectorError {
         )
         .with_sql_state(server.state.clone()),
         MySqlError::Io(IoError::Tls(_)) => ConnectorError::new(
+            "DBX-RS-MY-TLS-0003",
+            ErrorClass::Tls,
+            "MySQL-family TLS connection failed during query execution",
+            true,
+            false,
+        ),
+        MySqlError::Io(IoError::Io(error)) if contains_rustls_error(error) => ConnectorError::new(
             "DBX-RS-MY-TLS-0003",
             ErrorClass::Tls,
             "MySQL-family TLS connection failed during query execution",
@@ -1067,6 +1099,31 @@ mod tests {
         assert_eq!(classified.class(), ErrorClass::Authentication);
         assert!(!classified.to_string().contains("secret-user"));
         assert!(!classified.to_string().contains("secret-password"));
+    }
+
+    #[test]
+    fn rustls_errors_wrapped_by_tokio_io_are_classified_as_tls() {
+        let wrapped_tls = MySqlError::Io(IoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
+        )));
+
+        let connect = classify_connect_error(&wrapped_tls, TlsMode::VerifyFull);
+        assert_eq!(connect.class(), ErrorClass::Tls);
+        assert_eq!(connect.code(), "DBX-RS-MY-TLS-0001");
+
+        let query = classify_query_error(&wrapped_tls);
+        assert_eq!(query.class(), ErrorClass::Tls);
+        assert_eq!(query.code(), "DBX-RS-MY-TLS-0003");
+
+        let plain_io = MySqlError::Io(IoError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "synthetic non-TLS I/O failure",
+        )));
+        assert_eq!(
+            classify_connect_error(&plain_io, TlsMode::VerifyFull).class(),
+            ErrorClass::Tcp
+        );
     }
 
     #[test]
