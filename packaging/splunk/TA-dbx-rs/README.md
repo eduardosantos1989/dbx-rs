@@ -14,9 +14,9 @@ encrypted spool quotas, and HEC transport settings. Put overrides in `local/dbxr
 `default/dbxrs_inputs.conf` is intentionally empty. Put database stanzas in
 `local/dbxrs_inputs.conf`; see `README/dbxrs_inputs.conf.example` and the `.conf.spec` files. A
 stanza references a credential by `local:<name>`. Plaintext password, secret, token, and connection
-string settings are rejected. Omitted `mode` defaults to `batch`. PostgreSQL, MySQL, and MariaDB
-`rising` modes require an immutable, unique, non-nil `input_id` and distinct timestamp and integer
-cursor aliases; see the input specification before enabling a rising stanza. Identity migration
+string settings are rejected. Omitted `mode` defaults to `batch`. PostgreSQL, SQL Server, MySQL,
+and MariaDB `rising` modes require an immutable, unique, non-nil `input_id` and distinct timestamp
+and integer cursor aliases; see the input specification before enabling a rising stanza. Identity migration
 and checkpoint reset are not implemented, so do not change an established rising identity. Rising
 base queries cannot contain their own pagination; connector preparation rejects those clauses so
 the daemon owns the complete outer cursor scan and page limit.
@@ -27,9 +27,12 @@ make the connector Native Certified.
 
 MySQL and MariaDB are distinct Experimental Native connectors with offline-tested batch and rising
 implementations. They share a pure-Rust protocol crate but reject a server identified as the other
-product. Their TLS, exact-type, rising, cancellation, and Splunk delivery/recovery gates have not
-yet run against authorized live hosts, so neither connector is Native Certified or operationally
-certified.
+product. Their current live evidence remains narrower than a certification matrix.
+
+Microsoft SQL Server is a separate Experimental Native batch/rising connector. It uses TDS and
+Rustls directly, supports SQL authentication, and treats a configured `DATETIME2(0..6)` rising
+cursor as UTC. Integrated authentication, TDS 8 strict mode, Always Encrypted, named instances,
+Azure routing, and client-certificate authentication are outside this slice.
 
 Use a dedicated least-privilege database identity limited to the required read queries and metadata.
 Do not grant `FILE`, sequence-write, plugin/UDF installation, or database-administration privileges.
@@ -39,15 +42,17 @@ UDF from its name.
 
 Put connector assets in their product-specific roots: PostgreSQL uses `queries/psql/` and
 `certs/psql/`, Oracle uses `queries/oracle/` and `certs/oracle/`, MySQL uses `queries/mysql/` and
-`certs/mysql/`, and MariaDB uses `queries/mariadb/` and `certs/mariadb/`. Input stanzas may instead
+`certs/mysql/`, MariaDB uses `queries/mariadb/` and `certs/mariadb/`, and SQL Server uses
+`queries/mssql/` and `certs/mssql/`. Input stanzas may instead
 use `query = ...` for short inline SQL, but `query` and `query_file` are mutually exclusive. The
 daemon reads these assets but does not create or rewrite them. Installation-specific query and
 certificate files are ignored by the public source tree and must be supplied by an approved
 package, deployment server, deployer, or future UI workflow.
 
 PostgreSQL bytea keeps its existing lowercase `\\x`-prefixed hexadecimal JSON representation.
-Oracle RAW and MySQL-family binary values are rendered losslessly as lowercase `hex:`-prefixed JSON
-strings. No connector-specific database type escapes the native connector boundary.
+Oracle RAW, MySQL-family binary values, and SQL Server binary values are rendered losslessly as
+lowercase `hex:`-prefixed JSON strings. No connector-specific database type escapes the native
+connector boundary.
 
 Validate the effective layered configuration without starting the daemon:
 
@@ -105,6 +110,36 @@ The command generates a 256-bit installation key on first use and writes authent
 secret files with owner-only permissions under `$SPLUNK_HOME/var/lib/splunk/dbx-rs/credentials`.
 The key is generated locally and is not embedded in the binary. Back up the master key and
 encrypted secret directory together; losing the key makes the secrets unrecoverable.
+
+### Deployment Server credentials
+
+The cross-platform app builder embeds one public Ed25519 deployment authority in both OS binaries.
+Its private signing key stays outside every app. Each client creates a separate owner-protected
+HPKE identity and exposes only its public recipient:
+
+```bash
+$SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs deployment recipient init
+```
+
+On a protected administration host, seal a credential from standard input to one or more enrolled
+recipients. Use a new, greater revision for each update:
+
+```bash
+$SPLUNK_HOME/etc/apps/TA-dbx-rs/bin/dbx-rs deployment secret seal example_postgres \
+  --stdin \
+  --revision 1 \
+  --recipient 'dbxrs-hpke-x25519-v1:...' \
+  --authority-key /secure/dbx-rs-authority/deployment-authority-key.pk8 \
+  --output "$SPLUNK_HOME/etc/apps/TA-dbx-rs/deployment-secrets/example_postgres.dbxsecret"
+```
+
+Deployment Server distributes only the signed ciphertext. Before workers start and on each
+configuration reload, the daemon authenticates the envelope, decrypts it for this installation,
+imports it into the existing local encrypted store, and writes an authenticated revision receipt.
+Repeated delivery is idempotent, lower revisions are stale, and conflicting content at the same
+revision is rejected. Splunk KV is not used. Back up the client identity and receipt directory with
+the credential master key and encrypted secrets; deleting both receipts and local state is outside
+the authenticated rollback boundary.
 
 Transient daemon files live under `$SPLUNK_HOME/var/run/splunk/dbx-rs`; persistent generated state
 and identity live under `$SPLUNK_HOME/var/lib/splunk/dbx-rs`. The encrypted spool, its separate

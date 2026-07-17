@@ -1,0 +1,25 @@
+[package]
+name = "dbx-rs-app-builder"
+description = "Cross-platform Splunk deployment app builder for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dbx-rs-config.workspace = true
+dbx-rs-secure-store.workspace = true
+flate2.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+
+[[bin]]
+name = "dbx-rs-app-builder"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -5,12 +5,15 @@
 
 use crate::buffer::WriteBuffer;
 use crate::capabilities::Capabilities;
-use crate::constants::{charset, lob_duration, lob_op, FunctionCode, MessageType, OracleType, PacketType, PACKET_HEADER_SIZE};
+use crate::constants::{
+    charset, lob_duration, lob_op, FunctionCode, MessageType, OracleType, PacketType,
+    PACKET_HEADER_SIZE,
+};
 use crate::error::Result;
 use crate::types::LobLocator;
 use bytes::Bytes;
 
-use super::token::{NON_PIPELINED_TOKEN_NUMBER, write_request_token};
+use super::token::{write_request_token, NON_PIPELINED_TOKEN_NUMBER};
 
 /// LOB operation message for reading/writing LOB data
 pub struct LobOpMessage<'a> {

@@ -8,8 +8,14 @@ license.workspace = true
 publish = false
 
 [dependencies]
+hpke.workspace = true
 dbx-rs-connector-sdk.workspace = true
 ring.workspace = true
+subtle.workspace = true
+x509-cert.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
 
 [lints]
 workspace = true

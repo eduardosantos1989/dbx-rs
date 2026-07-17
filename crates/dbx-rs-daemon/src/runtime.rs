@@ -7,7 +7,10 @@ use std::time::Instant;
 use dbx_rs_config::{EffectiveConfig, HecInputManagement, HecState, load_effective_config};
 use dbx_rs_connector_sdk::{PrepareRequest, TimestampIdCursorRequest};
 use dbx_rs_native_connectors::NativeConnectorProvider;
-use dbx_rs_secure_store::{SecretStore, read_limited, write_new};
+use dbx_rs_secure_store::{
+    DeploymentIdentity, SecretStore, read_limited, reconcile_embedded_deployment_directory,
+    write_new,
+};
 use dbx_rs_spool::{Spool, SpoolKey, SpoolLimits};
 use dbx_rs_telemetry::{NdjsonTelemetry, OperationLimits, OperationMetrics, TelemetryConfig};
 use tokio::task::JoinHandle;
@@ -57,10 +60,11 @@ struct WorkerTask {
 pub fn bootstrap(
     config: &EffectiveConfig,
     splunk_home: &Path,
+    app_home: &Path,
 ) -> Result<BootstrapResult, DaemonError> {
     let _guard = InstanceGuard::acquire(&config.generic.paths.instance_lock_file)?;
     let _durable = preflight_durable_runtime(config, splunk_home)?;
-    prepare_runtime(config).map(|prepared| prepared.result)
+    prepare_runtime(config, app_home).map(|prepared| prepared.result)
 }
 
 pub async fn run(
@@ -107,7 +111,7 @@ async fn run_inner(
     let _guard = InstanceGuard::acquire(&config.generic.paths.instance_lock_file)?;
     let splunkd = SplunkdIdentity::capture(&config.generic.paths.splunkd_pid_file)?;
     let (mut prepared_inputs, rising, spool) = preflight_durable_runtime(config, splunk_home)?;
-    let prepared = prepare_runtime(config)?;
+    let prepared = prepare_runtime(config, app_home)?;
     let secrets = prepared.secrets;
     let mut hec = prepared.hec;
     let mut generations = ConfigurationGenerations::new(&prepared_inputs)?;
@@ -142,6 +146,7 @@ async fn run_inner(
 
         let now = Instant::now();
         if now >= next_reload {
+            reconcile_deployment_credentials(&secrets, app_home, config)?;
             if let Some((new_config, new_inputs)) =
                 reload_configuration(app_home, splunk_home, config, &prepared_inputs, &telemetry)
             {
@@ -254,17 +259,36 @@ fn signal_failure(
     }
 }
 
-fn prepare_runtime(config: &EffectiveConfig) -> Result<PreparedRuntime, DaemonError> {
+fn prepare_runtime(
+    config: &EffectiveConfig,
+    app_home: &Path,
+) -> Result<PreparedRuntime, DaemonError> {
+    DeploymentIdentity::load_or_create(&config.generic.paths.deployment_identity_file)?;
     let secrets = Arc::new(SecretStore::open(
         &config.generic.paths.master_key_file,
         &config.generic.paths.secret_dir,
     )?);
+    reconcile_deployment_credentials(&secrets, app_home, config)?;
     let (hec, result) = prepare_hec(config)?;
     Ok(PreparedRuntime {
         secrets,
         hec,
         result,
     })
+}
+
+fn reconcile_deployment_credentials(
+    secrets: &SecretStore,
+    app_home: &Path,
+    config: &EffectiveConfig,
+) -> Result<(), DaemonError> {
+    reconcile_embedded_deployment_directory(
+        secrets,
+        &app_home.join("deployment-secrets"),
+        &config.generic.paths.deployment_identity_file,
+        &config.generic.paths.deployment_receipt_dir,
+    )?;
+    Ok(())
 }
 
 fn configured_spool_limits(config: &EffectiveConfig) -> Result<SpoolLimits, DaemonError> {

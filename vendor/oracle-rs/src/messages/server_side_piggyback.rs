@@ -46,9 +46,7 @@ fn skip_keyword_value_pairs(buf: &mut ReadBuffer, count: u16) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn parse_server_side_piggyback(
-    buf: &mut ReadBuffer,
-) -> Result<Option<SessionIdentity>> {
+pub(crate) fn parse_server_side_piggyback(buf: &mut ReadBuffer) -> Result<Option<SessionIdentity>> {
     let opcode = buf.read_ub1()?;
     match opcode {
         QUERY_CACHE_INVALIDATION | TRACE_EVENT => Ok(None),

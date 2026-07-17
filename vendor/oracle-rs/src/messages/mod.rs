@@ -29,7 +29,5 @@ pub use lob_op::LobOpMessage;
 pub use protocol::ProtocolMessage;
 pub use redirect::RedirectMessage;
 pub use refuse::RefuseMessage;
-pub(crate) use server_side_piggyback::{SessionIdentity, parse_server_side_piggyback};
-pub(crate) use token::{
-    NON_PIPELINED_TOKEN_NUMBER, validate_response_token, write_request_token,
-};
+pub(crate) use server_side_piggyback::{parse_server_side_piggyback, SessionIdentity};
+pub(crate) use token::{validate_response_token, write_request_token, NON_PIPELINED_TOKEN_NUMBER};

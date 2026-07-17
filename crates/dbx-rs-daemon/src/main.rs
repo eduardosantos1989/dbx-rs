@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use dbx_rs_config::load_effective_config;
-use dbx_rs_secure_store::SecretStore;
+use dbx_rs_secure_store::{DeploymentIdentity, SecretStore};
 
 use crate::error::DaemonError;
 
@@ -102,9 +102,14 @@ async fn execute(command: Command) -> Result<(), DaemonError> {
                     runtime::run(&locations.app_home, &locations.splunk_home, config).await
                 }
                 Action::Bootstrap => {
-                    let result = runtime::bootstrap(&config, &locations.splunk_home)?;
+                    let result =
+                        runtime::bootstrap(&config, &locations.splunk_home, &locations.app_home)?;
                     println!("splunk_inputs_changed={}", result.splunk_inputs_changed);
                     println!("certificate_created={}", result.certificate_created);
+                    let recipient =
+                        DeploymentIdentity::load(&config.generic.paths.deployment_identity_file)?
+                            .recipient();
+                    println!("deployment_recipient={recipient}");
                     println!(
                         "splunk_restart_required={}",
                         result.splunk_inputs_changed || result.certificate_created

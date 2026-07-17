@@ -17,6 +17,15 @@ master_key_file = <absolute path>
 secret_dir = <absolute path>
 * Directory containing authenticated encrypted database credentials.
 
+deployment_identity_file = <absolute path>
+* Installation-specific HPKE private identity used only to unwrap signed deployment credentials.
+* Never distribute, copy between clients, or place this file in an app.
+
+deployment_receipt_dir = <absolute path>
+* Authenticated anti-rollback receipts for imported deployment credential revisions.
+* Back up and restore this directory with the credential master key, secret directory, and client
+  deployment identity.
+
 hec_token_file = <absolute path>
 * Protected local copy of the generated or externally provisioned HEC token.
 
@@ -53,7 +62,8 @@ spool_dir = <absolute path>
 managed_inputs_file = <absolute path>
 * Splunk inputs.conf file updated when manage_input is true.
 * This Splunk-discovered configuration file is the only generated default outside var.
-* Every configured path must resolve inside $SPLUNK_HOME; parent traversal is rejected.
+* `$DBX_RS_APP_HOME` expands to the running app directory. `$SPLUNK_HOME` expands to the Splunk
+  installation. Parent traversal is rejected.
 
 [logging]
 max_file_bytes = <integer>

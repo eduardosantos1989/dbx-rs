@@ -694,6 +694,7 @@ fn issue_from_error(error: &ControlError, field: &str, message: &str) -> Validat
 fn query_namespace(connector: &str) -> &'static str {
     match connector {
         "mariadb" => "mariadb",
+        "mssql" => "mssql",
         "mysql" => "mysql",
         "oracle" => "oracle",
         "postgres" => "psql",

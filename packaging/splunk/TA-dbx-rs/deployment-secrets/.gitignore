@@ -1,0 +1,3 @@
+*.dbxsecret
+!.gitignore
+!README.txt

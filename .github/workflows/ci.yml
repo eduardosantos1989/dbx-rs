@@ -58,9 +58,11 @@ jobs:
       - name: Verify packaged connector asset roots
         run: |
           test -f packaging/splunk/TA-dbx-rs/certs/mariadb/.gitignore
+          test -f packaging/splunk/TA-dbx-rs/certs/mssql/.gitignore
           test -f packaging/splunk/TA-dbx-rs/certs/mysql/.gitignore
           test -f packaging/splunk/TA-dbx-rs/certs/oracle/.gitignore
           test -f packaging/splunk/TA-dbx-rs/queries/mariadb/example.sql
+          test -f packaging/splunk/TA-dbx-rs/queries/mssql/example.sql
           test -f packaging/splunk/TA-dbx-rs/queries/mysql/example.sql
           test -f packaging/splunk/TA-dbx-rs/queries/oracle/example.sql
 
@@ -78,6 +80,8 @@ jobs:
           cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-daemon -i oracle-rs | grep -Fq dbx-rs-daemon
           cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-cli -i mysql_async | grep -Fq dbx-rs-cli
           cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-daemon -i mysql_async | grep -Fq dbx-rs-daemon
+          cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-cli -i mssql-client | grep -Fq dbx-rs-cli
+          cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-daemon -i mssql-client | grep -Fq dbx-rs-daemon
 
       - name: Verify MySQL-family pure-Rust dependency profile
         shell: bash
@@ -92,6 +96,23 @@ jobs:
           grep -Fq 'mysql_async feature "rustls-tls"' <<<"$features"
           if grep -Fq 'mysql_async feature "tracing"' <<<"$features"; then
             echo "MySQL-family connector enabled SQL/parameter tracing"
+            exit 1
+          fi
+
+      - name: Verify SQL Server native dependency profile
+        shell: bash
+        run: |
+          tree="$(cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-connector-mssql)"
+          if grep -Eq '(^| )((odbc|openssl)-sys|native-tls) v' <<<"$tree"; then
+            echo "SQL Server connector selected a forbidden native dependency"
+            exit 1
+          fi
+          features="$(cargo tree --target x86_64-unknown-linux-musl -p dbx-rs-connector-mssql -e features)"
+          grep -Fq 'mssql-client feature "tls"' <<<"$features"
+          grep -Fq 'tracing feature "max_level_off"' <<<"$features"
+          grep -Fq 'tracing feature "release_max_level_off"' <<<"$features"
+          if grep -Eq 'mssql-client feature "(always-encrypted|azure-identity|cert-auth|decimal|integrated-auth|native-certs|otel|sspi-auth)"' <<<"$features"; then
+            echo "SQL Server connector enabled an unsupported driver feature"
             exit 1
           fi
 

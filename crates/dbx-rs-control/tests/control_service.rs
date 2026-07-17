@@ -28,6 +28,7 @@ impl Fixture {
             app_home.join("default"),
             app_home.join("local"),
             app_home.join("queries/mariadb"),
+            app_home.join("queries/mssql"),
             app_home.join("queries/mysql"),
             app_home.join("queries/oracle"),
             app_home.join("queries/psql"),
@@ -127,12 +128,12 @@ fn named_validation_accepts_oracle_batch_without_disclosure() {
 }
 
 #[test]
-fn named_validation_accepts_mysql_and_mariadb_rising_without_disclosure() {
-    for connector in ["mysql", "mariadb"] {
+fn named_validation_accepts_mysql_mariadb_and_mssql_rising_without_disclosure() {
+    for (connector, port) in [("mysql", 3306), ("mariadb", 3306), ("mssql", 1433)] {
         let fixture = Fixture::new(Some("warehouse"));
         let configured = input_config("warehouse")
             .replace("connector = postgres", &format!("connector = {connector}"))
-            .replace("port = 5432", "port = 3306")
+            .replace("port = 5432", &format!("port = {port}"))
             .replace(
                 "disabled = false\n",
                 "disabled = false\nmode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\ncursor_timestamp_field = updated_at\ncursor_id_field = id\n",
@@ -160,6 +161,39 @@ fn named_validation_accepts_mysql_and_mariadb_rising_without_disclosure() {
         assert!(!trace.contains(QUERY_MARKER));
         assert!(!trace.contains(SECRET_MARKER));
     }
+}
+
+#[tokio::test]
+async fn mssql_query_files_use_only_the_mssql_asset_root() {
+    let fixture = Fixture::new(Some("warehouse"));
+    let configured = input_config("warehouse")
+        .replace("connector = postgres", "connector = mssql")
+        .replace("port = 5432", "port = 1433");
+    fs::write(
+        fixture.app_home.join("default/dbxrs_inputs.conf"),
+        configured,
+    )
+    .expect("SQL Server input configuration must be written");
+    let wrong_root = fixture.app_home.join("queries/psql/rejected.sql");
+    let approved = fixture.app_home.join("queries/mssql/rejected.sql");
+    fs::write(&wrong_root, "DELETE FROM private_table").expect("wrong-root query must be written");
+    fs::write(&approved, "DELETE FROM private_table").expect("approved-root query must be written");
+    let service = fixture.service();
+
+    let root_error = service
+        .test_query(query_file_request(wrong_root), CancellationToken::new())
+        .await
+        .expect_err("PostgreSQL query root must fail for SQL Server");
+    let query_error = service
+        .test_query(query_file_request(approved), CancellationToken::new())
+        .await
+        .expect_err("write query must fail before SQL Server network access");
+
+    assert_eq!(root_error.code(), "DBX-RS-CONTROL-0004");
+    assert_eq!(query_error.code(), "DBX-RS-MS-CFG-0018");
+    let trace = fixture.trace();
+    assert!(!trace.contains("private_table"));
+    assert!(!trace.contains(SECRET_MARKER));
 }
 
 #[test]
@@ -394,6 +428,8 @@ splunkd_pid_file = $SPLUNK_HOME/var/run/splunk/splunkd.pid
 instance_lock_file = $SPLUNK_HOME/var/run/splunk/dbx-rs/daemon.lock
 master_key_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/credentials/master.key
 secret_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/credentials/secrets
+deployment_identity_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/deployment/identity
+deployment_receipt_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/deployment/receipts
 hec_token_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/token
 hec_server_pem_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/server.pem
 hec_ca_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/ca.pem

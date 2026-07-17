@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 use dbx_rs_connector_sdk::ResolvedSecret;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
+use subtle::ConstantTimeEq;
 
 use crate::error::SecureStoreError;
-use crate::fs::{atomic_write, ensure_private_dir, read_limited, validate_private_dir, write_new};
+use crate::fs::{
+    atomic_write, ensure_private_dir, read_private_limited, validate_private_dir, write_new,
+};
 
 const MASTER_KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 12;
@@ -134,7 +137,7 @@ impl SecretStore {
             )
         })?;
         validate_name(name)?;
-        let mut protected = read_limited(&self.secret_path(name), MAX_SECRET_FILE_BYTES)?;
+        let mut protected = read_private_limited(&self.secret_path(name), MAX_SECRET_FILE_BYTES)?;
         let prefix_bytes = MAGIC.len() + 1 + NONCE_BYTES;
         if protected.len() <= prefix_bytes + aead::CHACHA20_POLY1305.tag_len()
             || &protected[..MAGIC.len()] != MAGIC
@@ -166,8 +169,26 @@ impl SecretStore {
         Ok(ResolvedSecret::new(encrypted))
     }
 
-    fn secret_path(&self, name: &str) -> PathBuf {
+    pub(crate) fn secret_path(&self, name: &str) -> PathBuf {
         self.directory.join(format!("{name}.secret"))
+    }
+
+    pub(crate) const fn key(&self) -> &[u8; MASTER_KEY_BYTES] {
+        &self.key
+    }
+
+    pub(crate) fn secret_matches(
+        &self,
+        name: &str,
+        expected: &[u8],
+    ) -> Result<bool, SecureStoreError> {
+        let path = self.secret_path(name);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let resolved = self.resolve(&format!("local:{name}"))?;
+        Ok(resolved.expose_secret().len() == expected.len()
+            && bool::from(resolved.expose_secret().ct_eq(expected)))
     }
 }
 
@@ -203,7 +224,7 @@ fn create_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], SecureStoreE
 }
 
 fn load_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], SecureStoreError> {
-    let mut bytes = read_limited(path, MASTER_KEY_BYTES as u64)?;
+    let mut bytes = read_private_limited(path, MASTER_KEY_BYTES as u64)?;
     if bytes.len() != MASTER_KEY_BYTES {
         bytes.fill(0);
         return Err(SecureStoreError::new(
@@ -221,7 +242,9 @@ fn load_master_key(path: &Path) -> Result<[u8; MASTER_KEY_BYTES], SecureStoreErr
     Ok(key)
 }
 
-fn encryption_key(bytes: &[u8; MASTER_KEY_BYTES]) -> Result<LessSafeKey, SecureStoreError> {
+pub(crate) fn encryption_key(
+    bytes: &[u8; MASTER_KEY_BYTES],
+) -> Result<LessSafeKey, SecureStoreError> {
     UnboundKey::new(&aead::CHACHA20_POLY1305, bytes)
         .map(LessSafeKey::new)
         .map_err(|_| {
@@ -242,7 +265,7 @@ fn aad(name: &str) -> Vec<u8> {
     aad
 }
 
-fn validate_name(name: &str) -> Result<(), SecureStoreError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), SecureStoreError> {
     if name.is_empty()
         || name.len() > 128
         || !name
@@ -261,7 +284,7 @@ fn validate_name(name: &str) -> Result<(), SecureStoreError> {
     Ok(())
 }
 
-fn trim_line_endings(bytes: &mut Vec<u8>) {
+pub(crate) fn trim_line_endings(bytes: &mut Vec<u8>) {
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
         bytes.pop();
     }

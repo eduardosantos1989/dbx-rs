@@ -26,11 +26,12 @@ credentials. Daemon and connector operations emit versioned, redacted NDJSON lif
 with epoch timestamps to Splunk's `dbx-trace.log`.
 
 Oracle is registered as an Experimental Native batch connector. Distinct MySQL and MariaDB
-Experimental Native connectors now implement offline-tested configuration, product detection,
-verified Rustls TLS, prepared typed Arrow streaming, and `TIMESTAMP`-plus-signed-`BIGINT` rising
-queries through a shared pure-Rust protocol crate. They reject cross-product selection and
-unsupported or lossy types. No authorized MySQL, MariaDB, or current Splunk target was available
-for this slice, so their product-specific live and end-to-end delivery gates remain unproven.
+Experimental Native connectors implement product detection, verified Rustls TLS, prepared typed
+Arrow streaming, and `TIMESTAMP`-plus-signed-`BIGINT` rising queries through a shared native
+protocol crate. Microsoft SQL Server is registered as a separate Experimental Native batch/rising
+connector using Rustls and TDS directly, with exact decimal/money conversion and a
+`DATETIME2(0..6)`-plus-`BIGINT` cursor. Unsupported, lossy, cross-product, and unsafe query forms
+fail closed. These connectors remain Experimental Native pending broader compatibility evidence.
 
 The `dbx-rs` administrative CLI now exposes typed JSON operations for validating one named input,
 probing its configured connector, and running a tightly bounded read-only query test.
@@ -41,8 +42,8 @@ currently an in-process boundary. The framed worker transport remains a later im
 
 A serializable checkpoint coordinator models independent collection and delivery completion,
 stale-generation fencing, replay recovery, and delivery-gated cursor commit. The scheduled daemon
-supports batch stanzas for every registered connector and rising stanzas for PostgreSQL, MySQL, and
-MariaDB with an immutable input UUID and typed timestamp-plus-integer cursor. Every active rising
+supports batch stanzas for every registered connector and rising stanzas for PostgreSQL, SQL
+Server, MySQL, and MariaDB with an immutable input UUID and typed timestamp-plus-integer cursor. Every active rising
 attempt has a durable scan, and each non-empty page is authenticated and sealed in the spool before
 its reference is appended to the scan. Startup reconciliation can adopt a sealed page, resume
 collection, persist one sequential delivery receipt at a time, compact receipted segments, and

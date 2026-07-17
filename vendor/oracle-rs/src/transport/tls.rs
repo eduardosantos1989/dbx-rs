@@ -551,10 +551,7 @@ mod tests {
             .with_client_cert("/path/to/client.pem", "/path/to/client.key")
             .with_server_dn_match(Some("CN=oracle".to_string()));
 
-        assert_eq!(
-            config.server_name,
-            Some("oracle.example.com".to_string())
-        );
+        assert_eq!(config.server_name, Some("oracle.example.com".to_string()));
         assert_eq!(config.ca_cert_path, Some("/path/to/ca.pem".to_string()));
         assert_eq!(
             config.client_cert_path,
@@ -569,7 +566,8 @@ mod tests {
 
     #[test]
     fn test_tls_config_wallet() {
-        let config = TlsConfig::new().with_wallet("/opt/oracle/wallet", Some("password".to_string()));
+        let config =
+            TlsConfig::new().with_wallet("/opt/oracle/wallet", Some("password".to_string()));
 
         assert_eq!(config.wallet_path, Some("/opt/oracle/wallet".to_string()));
         assert_eq!(config.wallet_password, Some("password".to_string()));

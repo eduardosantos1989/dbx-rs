@@ -4,8 +4,8 @@
 //! and wire transfer. This module provides encoding and decoding functions
 //! between Rust's serde_json::Value and Oracle's OSON wire format.
 
-use crate::{Error, Result};
 use super::binary::{decode_binary_double, decode_binary_float};
+use crate::{Error, Result};
 use bytes::Bytes;
 use std::collections::HashMap;
 
@@ -599,7 +599,9 @@ impl OsonDecoder {
 
     fn read_u8(&mut self) -> Result<u8> {
         if self.pos >= self.data.len() {
-            return Err(Error::ProtocolError("Unexpected end of OSON data".to_string()));
+            return Err(Error::ProtocolError(
+                "Unexpected end of OSON data".to_string(),
+            ));
         }
         let v = self.data[self.pos];
         self.pos += 1;
@@ -608,7 +610,9 @@ impl OsonDecoder {
 
     fn read_u16_be(&mut self) -> Result<u16> {
         if self.pos + 2 > self.data.len() {
-            return Err(Error::ProtocolError("Unexpected end of OSON data".to_string()));
+            return Err(Error::ProtocolError(
+                "Unexpected end of OSON data".to_string(),
+            ));
         }
         let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
@@ -617,7 +621,9 @@ impl OsonDecoder {
 
     fn read_u32_be(&mut self) -> Result<u32> {
         if self.pos + 4 > self.data.len() {
-            return Err(Error::ProtocolError("Unexpected end of OSON data".to_string()));
+            return Err(Error::ProtocolError(
+                "Unexpected end of OSON data".to_string(),
+            ));
         }
         let v = u32::from_be_bytes([
             self.data[self.pos],
@@ -631,7 +637,9 @@ impl OsonDecoder {
 
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
         if self.pos + len > self.data.len() {
-            return Err(Error::ProtocolError("Unexpected end of OSON data".to_string()));
+            return Err(Error::ProtocolError(
+                "Unexpected end of OSON data".to_string(),
+            ));
         }
         let v = self.data[self.pos..self.pos + len].to_vec();
         self.pos += len;
@@ -713,7 +721,10 @@ impl OsonEncoder {
 
         // Calculate flags
         let mut flags: u16 = FLAG_INLINE_LEAF;
-        let is_scalar = !matches!(value, serde_json::Value::Object(_) | serde_json::Value::Array(_));
+        let is_scalar = !matches!(
+            value,
+            serde_json::Value::Object(_) | serde_json::Value::Array(_)
+        );
 
         // Prepare field names components first if not scalar (to know segment size for flags)
         let field_names_components = if !is_scalar {
@@ -824,7 +835,8 @@ impl OsonEncoder {
 
         // Update field_name_to_id with sorted indices (1-based)
         for (sorted_index, (_, name)) in sorted_names.iter().enumerate() {
-            self.field_name_to_id.insert(name.clone(), (sorted_index + 1) as u32);
+            self.field_name_to_id
+                .insert(name.clone(), (sorted_index + 1) as u32);
         }
 
         // Also update field_names to be in sorted order for build_field_names_components
@@ -945,7 +957,11 @@ impl OsonEncoder {
         Ok(())
     }
 
-    fn encode_object(&self, map: &serde_json::Map<String, serde_json::Value>, buf: &mut Vec<u8>) -> Result<()> {
+    fn encode_object(
+        &self,
+        map: &serde_json::Map<String, serde_json::Value>,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
         let num_children = map.len();
 
         // Node type for object with uint32 offsets
@@ -967,7 +983,8 @@ impl OsonEncoder {
         }
 
         // Collect field IDs first
-        let field_ids: Vec<u8> = map.keys()
+        let field_ids: Vec<u8> = map
+            .keys()
             .map(|key| self.field_name_to_id.get(key).copied().unwrap_or(0) as u8)
             .collect();
 

@@ -46,7 +46,7 @@ pub(crate) fn validate_private_dir(path: &Path) -> Result<(), SecureStoreError> 
             true,
         ));
     }
-    validate_private_mode(&metadata)
+    validate_private_mode(path, &metadata)
 }
 
 /// Reads one regular, non-symlink file up to a fixed byte limit.
@@ -56,6 +56,27 @@ pub(crate) fn validate_private_dir(path: &Path) -> Result<(), SecureStoreError> 
 /// Returns an error when the path is a symlink, is not a regular file, exceeds the limit, or
 /// cannot be inspected or read.
 pub fn read_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, SecureStoreError> {
+    read_limited_inner(path, max_bytes, false)
+}
+
+/// Reads one owner-protected regular file up to a fixed byte limit.
+///
+/// On Unix, group or other permission bits are rejected. On Windows, inherited access is removed
+/// and the running account is granted full control before the file is read.
+///
+/// # Errors
+///
+/// Returns an error when the file is not regular, is a symlink, is too large, has insecure
+/// permissions, or cannot be inspected or read.
+pub fn read_private_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, SecureStoreError> {
+    read_limited_inner(path, max_bytes, true)
+}
+
+fn read_limited_inner(
+    path: &Path,
+    max_bytes: u64,
+    require_private: bool,
+) -> Result<Vec<u8>, SecureStoreError> {
     reject_existing_ancestor_symlinks(path)?;
     let file = File::open(path).map_err(|error| {
         SecureStoreError::io(
@@ -82,6 +103,9 @@ pub fn read_limited(path: &Path, max_bytes: u64) -> Result<Vec<u8>, SecureStoreE
             false,
             true,
         ));
+    }
+    if require_private {
+        validate_private_file_mode(path, &metadata)?;
     }
     let capacity = usize::try_from(metadata.len()).map_err(|_| {
         SecureStoreError::new(
@@ -274,7 +298,10 @@ fn set_create_mode(options: &mut OpenOptions, mode: u32) {
     options.mode(mode);
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
+fn set_create_mode(_options: &mut OpenOptions, _mode: u32) {}
+
+#[cfg(windows)]
 fn set_create_mode(_options: &mut OpenOptions, _mode: u32) {}
 
 #[cfg(unix)]
@@ -291,13 +318,18 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), SecureStoreError> {
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_mode(path: &Path, _mode: u32) -> Result<(), SecureStoreError> {
+    protect_windows_path(path, path.is_dir())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<(), SecureStoreError> {
-    Ok(())
+    Err(unsupported_permissions())
 }
 
 #[cfg(unix)]
-fn validate_private_mode(metadata: &fs::Metadata) -> Result<(), SecureStoreError> {
+fn validate_private_mode(_path: &Path, metadata: &fs::Metadata) -> Result<(), SecureStoreError> {
     use std::os::unix::fs::PermissionsExt;
 
     if metadata.permissions().mode() & 0o077 != 0 {
@@ -313,9 +345,50 @@ fn validate_private_mode(metadata: &fs::Metadata) -> Result<(), SecureStoreError
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn validate_private_mode(_metadata: &fs::Metadata) -> Result<(), SecureStoreError> {
+#[cfg(windows)]
+fn validate_private_mode(path: &Path, _metadata: &fs::Metadata) -> Result<(), SecureStoreError> {
+    protect_windows_path(path, true)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_private_mode(_path: &Path, _metadata: &fs::Metadata) -> Result<(), SecureStoreError> {
+    Err(unsupported_permissions())
+}
+
+#[cfg(unix)]
+fn validate_private_file_mode(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), SecureStoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(SecureStoreError::new(
+            "DBX-RS-FS-0021",
+            "configuration",
+            "permissions",
+            "private file permissions are too broad",
+            false,
+            true,
+        ));
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn validate_private_file_mode(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), SecureStoreError> {
+    protect_windows_path(path, false)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn validate_private_file_mode(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), SecureStoreError> {
+    Err(unsupported_permissions())
 }
 
 #[cfg(unix)]
@@ -335,4 +408,80 @@ fn sync_parent(parent: &Path) -> Result<(), SecureStoreError> {
 #[cfg(not(unix))]
 fn sync_parent(_parent: &Path) -> Result<(), SecureStoreError> {
     Ok(())
+}
+
+#[cfg(windows)]
+fn protect_windows_path(path: &Path, directory: bool) -> Result<(), SecureStoreError> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("whoami").output().map_err(|error| {
+        SecureStoreError::io(
+            "DBX-RS-FS-0022",
+            "permissions",
+            "failed to identify the Windows service account",
+            &error,
+        )
+    })?;
+    if !output.status.success() || output.stdout.len() > 512 {
+        return Err(windows_permissions_error());
+    }
+    let account = String::from_utf8(output.stdout).map_err(|_| windows_permissions_error())?;
+    let account = account.trim_matches(['\r', '\n']);
+    if account.is_empty()
+        || account.len() > 256
+        || account.chars().any(|character| character.is_control())
+    {
+        return Err(windows_permissions_error());
+    }
+    let grant = if directory {
+        format!("{account}:(OI)(CI)F")
+    } else {
+        format!("{account}:F")
+    };
+    let status = Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(grant)
+        .arg("/Q")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            SecureStoreError::io(
+                "DBX-RS-FS-0023",
+                "permissions",
+                "failed to apply Windows private-path permissions",
+                &error,
+            )
+        })?;
+    if !status.success() {
+        return Err(windows_permissions_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+const fn windows_permissions_error() -> SecureStoreError {
+    SecureStoreError::new(
+        "DBX-RS-FS-0024",
+        "configuration",
+        "permissions",
+        "Windows private-path permissions could not be enforced",
+        false,
+        true,
+    )
+}
+
+#[cfg(all(not(unix), not(windows)))]
+const fn unsupported_permissions() -> SecureStoreError {
+    SecureStoreError::new(
+        "DBX-RS-FS-0025",
+        "configuration",
+        "permissions",
+        "private-path permissions are unsupported on this platform",
+        false,
+        true,
+    )
 }

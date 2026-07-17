@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "connectors/mssql",
     "connectors/mysql",
     "connectors/oracle",
     "connectors/postgres",
+    "crates/dbx-rs-app-builder",
     "crates/dbx-rs-checkpoint",
     "crates/dbx-rs-cli",
     "crates/dbx-rs-config",
@@ -40,12 +42,20 @@ dbx-rs-spool = { version = "0.1.0", path = "crates/dbx-rs-spool" }
 dbx-rs-state = { version = "0.1.0", path = "crates/dbx-rs-state" }
 dbx-rs-telemetry = { version = "0.1.0", path = "crates/dbx-rs-telemetry" }
 futures-util = { version = "0.3.32", default-features = false }
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 http = { version = "1.4.2", default-features = false }
+hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 mysql_async = { version = "=0.37.0", default-features = false, features = [
     "minimal-rust",
     "ring",
     "rustls-tls",
     "tls12",
+] }
+mssql-client = { version = "=0.20.2", default-features = false, features = [
+    "chrono",
+    "encoding",
+    "tls",
+    "uuid",
 ] }
 oracle-rs = { version = "=0.1.7-dbx.1", path = "vendor/oracle-rs" }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
@@ -53,13 +63,20 @@ ring = { version = "0.17.14", default-features = false, features = ["alloc", "st
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", default-features = false, features = ["raw_value", "std"] }
+subtle = { version = "=2.6.1", default-features = false }
+tar = { version = "0.4.44", default-features = false }
 tokio = { version = "1.52.3", default-features = false }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
 tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring"] }
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
+tracing = { version = "0.1.44", default-features = false, features = [
+    "max_level_off",
+    "release_max_level_off",
+] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 uuid = { version = "1.18.1", default-features = false, features = ["std"] }
 webpki-roots = { version = "1.0.8", default-features = false }
+x509-cert = { version = "0.2.5", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

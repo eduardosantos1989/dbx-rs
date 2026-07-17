@@ -50,6 +50,8 @@ pub struct PathsConfig {
     pub instance_lock_file: PathBuf,
     pub master_key_file: PathBuf,
     pub secret_dir: PathBuf,
+    pub deployment_identity_file: PathBuf,
+    pub deployment_receipt_dir: PathBuf,
     pub hec_token_file: PathBuf,
     pub hec_server_pem_file: PathBuf,
     pub hec_ca_file: PathBuf,
@@ -268,7 +270,11 @@ pub fn load_effective_config(
 ) -> Result<EffectiveConfig, ConfigError> {
     let generic = load_layered(app_home, GENERIC_FILE)?;
     validate_generic_keys(&generic)?;
-    let generic = parse_generic(&generic, splunk_home)?;
+    let roots = PathRoots {
+        app_home,
+        splunk_home,
+    };
+    let generic = parse_generic(&generic, roots)?;
 
     let inputs = load_layered(app_home, INPUTS_FILE)?;
     let inputs = parse_inputs(&inputs, app_home, splunk_home, &generic)?;
@@ -301,6 +307,8 @@ fn validate_generic_keys(ini: &Ini) -> Result<(), ConfigError> {
                 "instance_lock_file",
                 "master_key_file",
                 "secret_dir",
+                "deployment_identity_file",
+                "deployment_receipt_dir",
                 "hec_token_file",
                 "hec_server_pem_file",
                 "hec_ca_file",
@@ -368,20 +376,33 @@ fn validate_generic_keys(ini: &Ini) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn parse_generic(ini: &Ini, splunk_home: &Path) -> Result<GenericConfig, ConfigError> {
+#[derive(Clone, Copy)]
+struct PathRoots<'a> {
+    app_home: &'a Path,
+    splunk_home: &'a Path,
+}
+
+fn parse_generic(ini: &Ini, roots: PathRoots<'_>) -> Result<GenericConfig, ConfigError> {
     let paths = PathsConfig {
-        log_file: required_var_path(ini, "paths", "log_file", splunk_home)?,
-        splunkd_pid_file: required_var_path(ini, "paths", "splunkd_pid_file", splunk_home)?,
-        instance_lock_file: required_runtime_path(ini, "paths", "instance_lock_file", splunk_home)?,
-        master_key_file: required_var_path(ini, "paths", "master_key_file", splunk_home)?,
-        secret_dir: required_var_path(ini, "paths", "secret_dir", splunk_home)?,
-        hec_token_file: required_var_path(ini, "paths", "hec_token_file", splunk_home)?,
-        hec_server_pem_file: required_var_path(ini, "paths", "hec_server_pem_file", splunk_home)?,
-        hec_ca_file: required_var_path(ini, "paths", "hec_ca_file", splunk_home)?,
-        spool_key_file: required_var_path(ini, "paths", "spool_key_file", splunk_home)?,
-        state_dir: required_var_path(ini, "paths", "state_dir", splunk_home)?,
-        spool_dir: required_var_path(ini, "paths", "spool_dir", splunk_home)?,
-        managed_inputs_file: required_path(ini, "paths", "managed_inputs_file", splunk_home)?,
+        log_file: required_var_path(ini, "paths", "log_file", roots)?,
+        splunkd_pid_file: required_var_path(ini, "paths", "splunkd_pid_file", roots)?,
+        instance_lock_file: required_runtime_path(ini, "paths", "instance_lock_file", roots)?,
+        master_key_file: required_var_path(ini, "paths", "master_key_file", roots)?,
+        secret_dir: required_var_path(ini, "paths", "secret_dir", roots)?,
+        deployment_identity_file: required_var_path(
+            ini,
+            "paths",
+            "deployment_identity_file",
+            roots,
+        )?,
+        deployment_receipt_dir: required_var_path(ini, "paths", "deployment_receipt_dir", roots)?,
+        hec_token_file: required_var_path(ini, "paths", "hec_token_file", roots)?,
+        hec_server_pem_file: required_var_path(ini, "paths", "hec_server_pem_file", roots)?,
+        hec_ca_file: required_var_path(ini, "paths", "hec_ca_file", roots)?,
+        spool_key_file: required_var_path(ini, "paths", "spool_key_file", roots)?,
+        state_dir: required_var_path(ini, "paths", "state_dir", roots)?,
+        spool_dir: required_var_path(ini, "paths", "spool_dir", roots)?,
+        managed_inputs_file: required_path(ini, "paths", "managed_inputs_file", roots)?,
     };
 
     let max_file_bytes = required_u64(ini, "logging", "max_file_bytes")?;
@@ -613,7 +634,7 @@ fn parse_input(
     let connector = required_label(ini, name, "connector")?;
     if !matches!(
         connector.as_str(),
-        "mariadb" | "mysql" | "oracle" | "postgres"
+        "mariadb" | "mssql" | "mysql" | "oracle" | "postgres"
     ) {
         return Err(ConfigError::new("DBX-RS-CFG-0014", "input.connector"));
     }
@@ -677,7 +698,10 @@ fn parse_input(
             ini,
             name,
             "tls_ca_file",
-            splunk_home,
+            PathRoots {
+                app_home,
+                splunk_home,
+            },
             &app_home.join("certs").join(query_namespace(&connector)),
             "DBX-RS-CFG-0049",
         )?,
@@ -833,7 +857,10 @@ fn parse_query_source(
         ini,
         section,
         "query_file",
-        splunk_home,
+        PathRoots {
+            app_home,
+            splunk_home,
+        },
         &app_home.join("queries").join(query_namespace(connector)),
         "DBX-RS-CFG-0048",
     )?;
@@ -853,6 +880,7 @@ fn parse_query_source(
 fn query_namespace(connector: &str) -> &'static str {
     match connector {
         "mariadb" => "mariadb",
+        "mssql" => "mssql",
         "mysql" => "mysql",
         "oracle" => "oracle",
         "postgres" => "psql",
@@ -972,19 +1000,19 @@ fn required_path(
     ini: &Ini,
     section: &str,
     key: &'static str,
-    splunk_home: &Path,
+    roots: PathRoots<'_>,
 ) -> Result<PathBuf, ConfigError> {
-    expand_path(&required(ini, section, key)?, splunk_home, key)
+    expand_path(&required(ini, section, key)?, roots, key)
 }
 
 fn required_var_path(
     ini: &Ini,
     section: &str,
     key: &'static str,
-    splunk_home: &Path,
+    roots: PathRoots<'_>,
 ) -> Result<PathBuf, ConfigError> {
-    let path = required_path(ini, section, key, splunk_home)?;
-    if !path.starts_with(splunk_home.join("var")) {
+    let path = required_path(ini, section, key, roots)?;
+    if !path.starts_with(roots.splunk_home.join("var")) {
         return Err(ConfigError::new("DBX-RS-CFG-0043", key));
     }
     Ok(path)
@@ -994,10 +1022,10 @@ fn required_runtime_path(
     ini: &Ini,
     section: &str,
     key: &'static str,
-    splunk_home: &Path,
+    roots: PathRoots<'_>,
 ) -> Result<PathBuf, ConfigError> {
-    let path = required_path(ini, section, key, splunk_home)?;
-    let runtime_root = splunk_home.join("var/run/splunk/dbx-rs");
+    let path = required_path(ini, section, key, roots)?;
+    let runtime_root = roots.splunk_home.join("var/run/splunk/dbx-rs");
     if path == runtime_root || !path.starts_with(runtime_root) {
         return Err(ConfigError::new("DBX-RS-CFG-0044", key));
     }
@@ -1008,11 +1036,11 @@ fn optional_path(
     ini: &Ini,
     section: &str,
     key: &'static str,
-    splunk_home: &Path,
+    roots: PathRoots<'_>,
 ) -> Result<Option<PathBuf>, ConfigError> {
     optional(ini, section, key)
         .filter(|value| !value.is_empty())
-        .map(|value| expand_path(&value, splunk_home, key))
+        .map(|value| expand_path(&value, roots, key))
         .transpose()
 }
 
@@ -1020,11 +1048,11 @@ fn optional_asset_path(
     ini: &Ini,
     section: &str,
     key: &'static str,
-    splunk_home: &Path,
+    roots: PathRoots<'_>,
     asset_root: &Path,
     error_code: &'static str,
 ) -> Result<Option<PathBuf>, ConfigError> {
-    let path = optional_path(ini, section, key, splunk_home)?;
+    let path = optional_path(ini, section, key, roots)?;
     if path
         .as_ref()
         .is_some_and(|path| path == asset_root || !path.starts_with(asset_root))
@@ -1036,15 +1064,19 @@ fn optional_asset_path(
 
 fn expand_path(
     value: &str,
-    splunk_home: &Path,
+    roots: PathRoots<'_>,
     field: &'static str,
 ) -> Result<PathBuf, ConfigError> {
-    let path = if value == "$SPLUNK_HOME" {
-        splunk_home.to_path_buf()
+    let (path, allowed_root) = if value == "$DBX_RS_APP_HOME" {
+        (roots.app_home.to_path_buf(), roots.app_home)
+    } else if let Some(relative) = value.strip_prefix("$DBX_RS_APP_HOME/") {
+        (roots.app_home.join(relative), roots.app_home)
+    } else if value == "$SPLUNK_HOME" {
+        (roots.splunk_home.to_path_buf(), roots.splunk_home)
     } else if let Some(relative) = value.strip_prefix("$SPLUNK_HOME/") {
-        splunk_home.join(relative)
+        (roots.splunk_home.join(relative), roots.splunk_home)
     } else {
-        PathBuf::from(value)
+        (PathBuf::from(value), roots.splunk_home)
     };
     if path
         .components()
@@ -1055,7 +1087,7 @@ fn expand_path(
     if !path.is_absolute() {
         return Err(ConfigError::new("DBX-RS-CFG-0033", field));
     }
-    if !path.starts_with(splunk_home) {
+    if !path.starts_with(allowed_root) {
         return Err(ConfigError::new("DBX-RS-CFG-0042", field));
     }
     Ok(path)
@@ -1093,13 +1125,15 @@ splunkd_pid_file = $SPLUNK_HOME/var/run/splunk/splunkd.pid
 instance_lock_file = $SPLUNK_HOME/var/run/splunk/dbx-rs/daemon.lock
 master_key_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/credentials/master.key
 secret_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/credentials/secrets
+deployment_identity_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/deployment/identity
+deployment_receipt_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/deployment/receipts
 hec_token_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/token
 hec_server_pem_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/server.pem
 hec_ca_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/hec/ca.pem
 spool_key_file = $SPLUNK_HOME/var/lib/splunk/dbx-rs/durable/spool.key
 state_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/state
 spool_dir = $SPLUNK_HOME/var/lib/splunk/dbx-rs/spool
-managed_inputs_file = $SPLUNK_HOME/etc/apps/TA-dbx-rs/local/inputs.conf
+managed_inputs_file = $DBX_RS_APP_HOME/local/inputs.conf
 
 [logging]
 max_file_bytes = 10000000
@@ -1189,6 +1223,15 @@ source = dbx_rs:heartbeat
             )
     }
 
+    fn mssql_input_config() -> String {
+        input_config()
+            .replace("connector = postgres", "connector = mssql")
+            .replace("port = 5432", "port = 1433")
+            .replace("certs/psql/", "certs/mssql/")
+            .replace("queries/psql/", "queries/mssql/")
+            .replace("dbx_rs:postgres:heartbeat", "dbx_rs:mssql:heartbeat")
+    }
+
     #[test]
     fn loads_typed_defaults_and_local_override() {
         let (root, app) = fixture();
@@ -1203,6 +1246,18 @@ source = dbx_rs:heartbeat
         assert_eq!(effective.inputs[0].mode, CollectionMode::Batch);
         assert_eq!(effective.inputs[0].connector, "postgres");
         assert!(matches!(&effective.inputs[0].query, QuerySource::File(_)));
+        assert_eq!(
+            effective.generic.paths.managed_inputs_file,
+            app.join("local/inputs.conf")
+        );
+        assert_eq!(
+            effective.generic.paths.deployment_identity_file,
+            root.join("var/lib/splunk/dbx-rs/deployment/identity")
+        );
+        assert_eq!(
+            effective.generic.paths.deployment_receipt_dir,
+            root.join("var/lib/splunk/dbx-rs/deployment/receipts")
+        );
         assert_eq!(
             effective.generic.logging.max_file_bytes,
             HARD_LOG_FILE_BYTES
@@ -1276,6 +1331,35 @@ source = dbx_rs:heartbeat
     }
 
     #[test]
+    fn loads_mssql_rising_with_connector_asset_roots() {
+        let (root, app) = fixture();
+        let configured = mssql_input_config().replace(
+            "disabled = false",
+            "disabled = false\nmode = rising\ninput_id = 123e4567-e89b-12d3-a456-426614174000\ncursor_timestamp_field = updated_at\ncursor_id_field = id",
+        );
+        fs::write(app.join("default").join(INPUTS_FILE), configured)
+            .expect("SQL Server fixture must be written");
+
+        let effective =
+            load_effective_config(&app, &root).expect("SQL Server rising input must load");
+        let input = &effective.inputs[0];
+
+        assert_eq!(input.connector, "mssql");
+        assert!(matches!(input.mode, CollectionMode::Rising(_)));
+        assert!(
+            input
+                .tls_ca_file
+                .as_ref()
+                .is_some_and(|path| path.starts_with(app.join("certs/mssql")))
+        );
+        assert!(matches!(
+            &input.query,
+            QuerySource::File(path) if path.starts_with(app.join("queries/mssql"))
+        ));
+        fs::remove_dir_all(root).expect("fixture must be removed");
+    }
+
+    #[test]
     fn shipped_examples_parse_with_product_specific_modes_and_asset_roots() {
         let (root, app) = fixture();
         fs::write(
@@ -1287,9 +1371,9 @@ source = dbx_rs:heartbeat
         let effective =
             load_effective_config(&app, &root).expect("shipped input examples must parse");
 
-        assert_eq!(effective.inputs.len(), 7);
+        assert_eq!(effective.inputs.len(), 9);
         assert!(effective.inputs.iter().all(|input| input.disabled));
-        for connector in ["mysql", "mariadb"] {
+        for connector in ["mysql", "mariadb", "mssql"] {
             let product_inputs = effective
                 .inputs
                 .iter()

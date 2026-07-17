@@ -292,12 +292,27 @@ impl std::fmt::Display for Value {
             },
             Value::Json(json) => write!(f, "{}", json),
             Value::Vector(vec) => write!(f, "<VECTOR: {} dimensions>", vec.dimensions()),
-            Value::Cursor(cursor) => write!(f, "<CURSOR: id={}, {} columns>", cursor.cursor_id(), cursor.column_count()),
+            Value::Cursor(cursor) => write!(
+                f,
+                "<CURSOR: id={}, {} columns>",
+                cursor.cursor_id(),
+                cursor.column_count()
+            ),
             Value::Collection(obj) => {
                 if obj.is_collection {
-                    write!(f, "<COLLECTION {}: {} elements>", obj.type_name, obj.elements.len())
+                    write!(
+                        f,
+                        "<COLLECTION {}: {} elements>",
+                        obj.type_name,
+                        obj.elements.len()
+                    )
                 } else {
-                    write!(f, "<OBJECT {}: {} attributes>", obj.type_name, obj.values.len())
+                    write!(
+                        f,
+                        "<OBJECT {}: {} attributes>",
+                        obj.type_name,
+                        obj.values.len()
+                    )
                 }
             }
         }
@@ -458,19 +473,13 @@ impl<'a> RowDataDecoder<'a> {
     }
 
     /// Decode a single row from the buffer
-    pub fn decode_row(
-        &self,
-        buf: &mut ReadBuffer,
-        previous_row: Option<&Row>,
-    ) -> Result<Row> {
+    pub fn decode_row(&self, buf: &mut ReadBuffer, previous_row: Option<&Row>) -> Result<Row> {
         let mut values = Vec::with_capacity(self.columns.len());
 
         for (index, column) in self.columns.iter().enumerate() {
             let value = if self.is_duplicate(index) {
                 let previous = previous_row.ok_or_else(|| {
-                    Error::Protocol(
-                        "Oracle duplicate row value has no preceding row".to_string(),
-                    )
+                    Error::Protocol("Oracle duplicate row value has no preceding row".to_string())
                 })?;
                 previous.get(index).cloned().ok_or_else(|| {
                     Error::Protocol(
@@ -501,16 +510,10 @@ impl<'a> RowDataDecoder<'a> {
 
         // Read the column data based on type
         match column.oracle_type {
-            OracleType::Varchar | OracleType::Char | OracleType::Long => {
-                self.decode_string(buf)
-            }
-            OracleType::Number | OracleType::BinaryInteger => {
-                self.decode_number(buf)
-            }
+            OracleType::Varchar | OracleType::Char | OracleType::Long => self.decode_string(buf),
+            OracleType::Number | OracleType::BinaryInteger => self.decode_number(buf),
             OracleType::Date => self.decode_date(buf),
-            OracleType::Timestamp | OracleType::TimestampLtz => {
-                self.decode_timestamp(buf, false)
-            }
+            OracleType::Timestamp | OracleType::TimestampLtz => self.decode_timestamp(buf, false),
             OracleType::TimestampTz => self.decode_timestamp(buf, true),
             OracleType::Raw | OracleType::LongRaw => self.decode_raw(buf),
             OracleType::BinaryFloat => self.decode_binary_float(buf),
@@ -822,7 +825,10 @@ mod tests {
         let row = Row::with_names(values, names);
 
         assert_eq!(row.get_by_name("ID").and_then(Value::as_i64), Some(1));
-        assert_eq!(row.get_by_name("name").and_then(Value::as_str), Some("hello"));
+        assert_eq!(
+            row.get_by_name("name").and_then(Value::as_str),
+            Some("hello")
+        );
         assert!(row.get_by_name("nonexistent").is_none());
     }
 

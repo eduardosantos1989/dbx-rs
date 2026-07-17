@@ -1,0 +1,24 @@
+[package]
+name = "dbx-rs-connector-mssql"
+description = "Experimental native Microsoft SQL Server connector for dbx-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+dbx-rs-connector-sdk.workspace = true
+mssql-client.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

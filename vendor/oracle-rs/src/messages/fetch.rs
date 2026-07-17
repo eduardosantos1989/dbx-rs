@@ -7,10 +7,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::buffer::WriteBuffer;
 use crate::capabilities::Capabilities;
-use crate::constants::{FetchOrientation, FunctionCode, MessageType, PacketType, PACKET_HEADER_SIZE};
+use crate::constants::{
+    FetchOrientation, FunctionCode, MessageType, PacketType, PACKET_HEADER_SIZE,
+};
 use crate::error::Result;
 
-use super::token::{NON_PIPELINED_TOKEN_NUMBER, write_request_token};
+use super::token::{write_request_token, NON_PIPELINED_TOKEN_NUMBER};
 
 /// Fetch message to retrieve rows from a cursor
 #[derive(Debug)]
@@ -66,11 +68,7 @@ impl FetchMessage {
     }
 
     /// Build the fetch request packet with the negotiated SDU header format.
-    pub fn build_request_with_sdu(
-        &self,
-        caps: &Capabilities,
-        large_sdu: bool,
-    ) -> Result<Bytes> {
+    pub fn build_request_with_sdu(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
         let mut buf = WriteBuffer::new();
 
         // Write message header
@@ -147,7 +145,10 @@ mod tests {
 
         // Check packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);
-        assert_eq!(u16::from_be_bytes(packet[..2].try_into().unwrap()) as usize, packet.len());
+        assert_eq!(
+            u16::from_be_bytes(packet[..2].try_into().unwrap()) as usize,
+            packet.len()
+        );
         assert_eq!(packet[4], PacketType::Data as u8);
 
         // Check data flags are present
@@ -196,7 +197,10 @@ mod tests {
 
         let packet = msg.build_request_with_sdu(&caps, true).unwrap();
 
-        assert_eq!(u32::from_be_bytes(packet[..4].try_into().unwrap()), packet.len() as u32);
+        assert_eq!(
+            u32::from_be_bytes(packet[..4].try_into().unwrap()),
+            packet.len() as u32
+        );
         assert_eq!(packet[4], PacketType::Data as u8);
     }
 }

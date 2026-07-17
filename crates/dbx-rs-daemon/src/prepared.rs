@@ -904,11 +904,11 @@ source = private:source
     }
 
     #[test]
-    fn mysql_and_mariadb_batch_and_rising_prepare_distinct_connector_state() {
-        for connector in ["mysql", "mariadb"] {
+    fn mysql_mariadb_and_mssql_batch_and_rising_prepare_distinct_connector_state() {
+        for (connector, port) in [("mysql", 3306), ("mariadb", 3306), ("mssql", 1433)] {
             let mut batch = input(QuerySource::Inline("SELECT 1".into()), None);
             batch.connector = connector.into();
-            batch.port = 3306;
+            batch.port = port;
             let prepared_batch =
                 prepare_input(&batch, &hec()).expect("MySQL-family batch must prepare");
 
@@ -918,7 +918,7 @@ source = private:source
 
             let (mut rising, rising_hec) = parsed_rising_input();
             rising.connector = connector.into();
-            rising.port = 3306;
+            rising.port = port;
             let prepared_rising = prepare_input(&rising, &rising_hec)
                 .expect("MySQL-family rising input must prepare");
 
