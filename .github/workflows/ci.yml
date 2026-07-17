@@ -138,3 +138,25 @@ jobs:
           target/x86_64-unknown-linux-musl/release/dbx-rs --version
           target/x86_64-unknown-linux-musl/release/dbx-rs-daemon --version
           target/x86_64-unknown-linux-musl/release/dbx-rs-connector-postgres --help >/dev/null
+
+      - name: Verify shipped release size budgets
+        shell: bash
+        run: |
+          check_size() {
+            local binary="$1"
+            local maximum="$2"
+            local actual
+            actual="$(stat --format='%s' "$binary")"
+            printf '%s: %s bytes (maximum %s)\n' "$binary" "$actual" "$maximum"
+            if (( actual > maximum )); then
+              echo "$binary exceeds its release size budget"
+              exit 1
+            fi
+            if ! file "$binary" | grep -Fq 'stripped'; then
+              echo "$binary retains symbols"
+              exit 1
+            fi
+          }
+
+          check_size target/x86_64-unknown-linux-musl/release/dbx-rs $((8 * 1024 * 1024))
+          check_size target/x86_64-unknown-linux-musl/release/dbx-rs-daemon $((9 * 1024 * 1024))
